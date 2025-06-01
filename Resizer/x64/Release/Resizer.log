@@ -1,0 +1,7 @@
+﻿  main.cpp
+C:\Users\fadet\source\repos\Resizer\Resizer\main.cpp(1055,31): warning C4244: '=': conversion from 'int64_t' to 'int', possible loss of data
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 95 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  Resizer.vcxproj -> C:\Users\fadet\source\repos\Resizer\x64\Release\Resizer.exe
