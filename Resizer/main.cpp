@@ -49,6 +49,11 @@ extern "C" {
 
 #define IDT_UI_REFRESH            3001
 
+#define IDC_GRP_SETTINGS          2010
+#define IDC_GRP_RANGE             2011
+#define IDC_GRP_RESOLUTION        2012
+#define IDC_GRP_PLAYER            2013
+
 // ------------------------------ Globals ------------------------------
 #define WM_APP_FRAME_READY (WM_APP + 1)
 static HWND     g_mainHwnd = nullptr;
@@ -81,6 +86,12 @@ static HWND     g_hBtnBack = nullptr;
 static HWND     g_hBtnMarkIn = nullptr;
 static HWND     g_hBtnMarkOut = nullptr;
 
+static HWND     g_hGrpSettings   = nullptr;
+static HWND     g_hGrpRange      = nullptr;
+static HWND     g_hGrpResolution = nullptr;
+static HWND     g_hGrpPlayer     = nullptr;
+static HFONT    g_hFont          = nullptr;
+
 static HBITMAP  g_hFrameBitmap = nullptr;
 static int      g_frameWidth = 0;
 static int      g_frameHeight = 0;
@@ -96,6 +107,8 @@ static volatile bool g_decodeSingleFrame = false;
 static double   g_videoFPS = 30.0;
 static bool     g_playerReady = false;
 static volatile int g_stepDir = 0; // +1 forward, -1 backward
+static bool         g_isDragging   = false; // true while user drags the seekbar thumb
+static bool         g_isGenerating = false; // true while a seek-frame decode is in flight
 
 // Forward declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -120,91 +133,81 @@ void SetMarkOutFromCurrent(HWND hwnd);
 
 // ------------------------------ UI Layout ------------------------------
 void HandleResize(HWND hwnd, int clientW, int clientH) {
-    const int margin = 10;
+    const int M  = 10;  // outer margin
+    const int P  = 8;   // inner padding inside group boxes
+    const int GH = 22;  // group box header height
+    const int RH = 22;  // standard row height
 
-    int labelHeightSize;
+    int y = M;
+
+    // Info bar – always at top, full width
+    MoveWindow(g_hInfoStatic, M, y, clientW - M * 2, RH, TRUE);
+    y += RH + M;
+
+    // === Output Settings ===
+    int settingsH = GH + P + RH + 5 + RH + P;
+    MoveWindow(g_hGrpSettings, M, y, clientW - M * 2, settingsH, TRUE);
     {
-        HDC hdc = GetDC(hwnd);
-        HFONT hFont = (HFONT)SendMessage(g_hSizeStatic, WM_GETFONT, 0, 0);
-        SelectObject(hdc, hFont);
-        wchar_t text[] = L"Target size (MB):";
-        SIZE sz;
-        GetTextExtentPoint32W(hdc, text, lstrlenW(text), &sz);
-        ReleaseDC(hwnd, hdc);
-        int labelW = sz.cx + 4;
-        labelHeightSize = sz.cy;
-        MoveWindow(g_hSizeStatic, margin, margin, labelW, labelHeightSize, TRUE);
-
-        int editX = margin + labelW + margin;
-        int editW = max(50, clientW - editX - margin);
-        MoveWindow(g_hSizeEdit, editX, margin, editW, labelHeightSize, TRUE);
+        int ix = M + P, iy = y + GH;
+        int lw = 130;
+        int ew = max(50, clientW - M * 2 - P * 2 - lw - 6);
+        MoveWindow(g_hSizeStatic,   ix,          iy, lw, RH, TRUE);
+        MoveWindow(g_hSizeEdit,     ix + lw + 6, iy, ew, RH, TRUE);
+        iy += RH + 5;
+        MoveWindow(g_hSuffixStatic, ix,          iy, lw, RH, TRUE);
+        MoveWindow(g_hSuffixEdit,   ix + lw + 6, iy, ew, RH, TRUE);
     }
+    y += settingsH + M;
 
-    int ySuffix = margin + labelHeightSize + margin;
-    int labelHeightSuffix;
+    // === Range ===
+    int rangeH = GH + P + RH + P;
+    MoveWindow(g_hGrpRange, M, y, clientW - M * 2, rangeH, TRUE);
     {
-        HDC hdc = GetDC(hwnd);
-        HFONT hFont = (HFONT)SendMessage(g_hSuffixStatic, WM_GETFONT, 0, 0);
-        SelectObject(hdc, hFont);
-        wchar_t text[] = L"Suffix:";
-        SIZE sz;
-        GetTextExtentPoint32W(hdc, text, lstrlenW(text), &sz);
-        ReleaseDC(hwnd, hdc);
-        int labelW = sz.cx + 4;
-        labelHeightSuffix = sz.cy;
-        MoveWindow(g_hSuffixStatic, margin, ySuffix, labelW, labelHeightSuffix, TRUE);
-
-        int editX = margin + labelW + margin;
-        int editW = max(50, clientW - editX - margin);
-        MoveWindow(g_hSuffixEdit, editX, ySuffix, editW, labelHeightSuffix, TRUE);
+        int ix = M + P, iy = y + GH;
+        int radioW = 115, labelW = 65, editW = 80;
+        MoveWindow(g_hRangeFullRadio,   ix,                           iy, radioW, RH, TRUE);
+        MoveWindow(g_hRangeCustomRadio, ix + radioW + 8,              iy, radioW, RH, TRUE);
+        int x2 = ix + radioW * 2 + 24;
+        MoveWindow(g_hStartStatic, x2,                                iy, labelW, RH, TRUE);
+        MoveWindow(g_hStartEdit,   x2 + labelW,                       iy, editW,  RH, TRUE);
+        MoveWindow(g_hEndStatic,   x2 + labelW + editW + 8,           iy, labelW, RH, TRUE);
+        MoveWindow(g_hEndEdit,     x2 + labelW * 2 + editW + 8,       iy, editW,  RH, TRUE);
     }
+    y += rangeH + M;
 
-    int yRange = ySuffix + labelHeightSuffix + margin;
-    MoveWindow(g_hRangeFullRadio, margin, yRange, 120, 20, TRUE);
-    MoveWindow(g_hRangeCustomRadio, margin + 140, yRange, 120, 20, TRUE);
-    MoveWindow(g_hStartStatic, margin + 280, yRange, 100, 20, TRUE);
-    MoveWindow(g_hStartEdit, margin + 380, yRange, 80, 20, TRUE);
-    MoveWindow(g_hEndStatic, margin + 480, yRange, 100, 20, TRUE);
-    MoveWindow(g_hEndEdit, margin + 580, yRange, 80, 20, TRUE);
-
-    int yRes = yRange + 30;
-    MoveWindow(g_hFullRadio, margin, yRes, 300, 20, TRUE);
-    MoveWindow(g_hHalfRadio, margin, yRes + 25, 300, 20, TRUE);
-    MoveWindow(g_hQuarterRadio, margin, yRes + 50, 300, 20, TRUE);
-
-    int btnY = yRes + 75;
-    MoveWindow(g_hStartButton, margin, btnY, 150, 30, TRUE);
-
-    int yPlayer = btnY + 40;
-    int btnW = 90, btnH = 26;
-    MoveWindow(g_hBtnPlayPause, margin, yPlayer, btnW, btnH, TRUE);
-    MoveWindow(g_hBtnBack, margin + btnW + 6, yPlayer, btnW, btnH, TRUE);
-    MoveWindow(g_hBtnFwd, margin + (btnW + 6) * 2, yPlayer, btnW, btnH, TRUE);
-    MoveWindow(g_hBtnMarkIn, margin + (btnW + 6) * 3 + 20, yPlayer, btnW, btnH, TRUE);
-    MoveWindow(g_hBtnMarkOut, margin + (btnW + 6) * 4 + 20, yPlayer, btnW, btnH, TRUE);
-
-    int sbX = margin;
-    int sbY = yPlayer + btnH + 8;
-    int sbW = clientW - margin * 2;
-    MoveWindow(g_hSeekbar, sbX, sbY, sbW, 28, TRUE);
-
-    if (g_hFrameBitmap) {
-        HDC hdc = GetDC(hwnd);
-        HFONT hFont = (HFONT)SendMessage(g_hInfoStatic, WM_GETFONT, 0, 0);
-        SelectObject(hdc, hFont);
-        wchar_t buf[512];
-        GetWindowTextW(g_hInfoStatic, buf, ARRAYSIZE(buf));
-        SIZE sz;
-        GetTextExtentPoint32W(hdc, buf, lstrlenW(buf), &sz);
-        ReleaseDC(hwnd, hdc);
-        MoveWindow(g_hInfoStatic, margin, sbY + 28 + 6, sz.cx, sz.cy, TRUE);
+    // === Resolution ===
+    int resH = GH + P + RH + P;
+    MoveWindow(g_hGrpResolution, M, y, clientW - M * 2, resH, TRUE);
+    {
+        int ix    = M + P, iy = y + GH;
+        int avail = clientW - M * 2 - P * 2;
+        int each  = (avail - 20) / 3;
+        MoveWindow(g_hFullRadio,    ix,                   iy, each, RH, TRUE);
+        MoveWindow(g_hHalfRadio,    ix + each + 10,       iy, each, RH, TRUE);
+        MoveWindow(g_hQuarterRadio, ix + (each + 10) * 2, iy, each, RH, TRUE);
     }
-    else {
-        int staticW = 240, staticH = 20;
-        int x = clientW - staticW - margin;
-        int y = clientH - staticH - margin;
-        MoveWindow(g_hInfoStatic, x, y, staticW, staticH, TRUE);
+    y += resH + M;
+
+    // === Start button ===
+    MoveWindow(g_hStartButton, M, y, clientW - M * 2, 32, TRUE);
+    y += 32 + M;
+
+    // === Player ===
+    const int btnW = 90, btnH = 28, seekH = 28;
+    int playerH = GH + P + btnH + 6 + seekH + P;
+    MoveWindow(g_hGrpPlayer, M, y, clientW - M * 2, playerH, TRUE);
+    {
+        int ix    = M + P, iy = y + GH;
+        int avail = clientW - M * 2 - P * 2;
+        MoveWindow(g_hBtnPlayPause, ix,                       iy, btnW, btnH, TRUE);
+        MoveWindow(g_hBtnBack,      ix + btnW + 6,            iy, btnW, btnH, TRUE);
+        MoveWindow(g_hBtnFwd,       ix + (btnW + 6) * 2,      iy, btnW, btnH, TRUE);
+        MoveWindow(g_hBtnMarkIn,    ix + (btnW + 6) * 3 + 16, iy, btnW, btnH, TRUE);
+        MoveWindow(g_hBtnMarkOut,   ix + (btnW + 6) * 4 + 16, iy, btnW, btnH, TRUE);
+        iy += btnH + 6;
+        MoveWindow(g_hSeekbar, ix, iy, avail, seekH, TRUE);
     }
+    // frame preview fills remaining client area below the player group
 
     InvalidateRect(hwnd, nullptr, TRUE);
 }
@@ -229,7 +232,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_mainHwnd = CreateWindowEx(
         0, CLASS_NAME, L"Resizer",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1000, 760,
         nullptr, nullptr, hInstance, nullptr
     );
@@ -259,8 +262,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE: {
         DragAcceptFiles(hwnd, TRUE);
 
+        // Create UI font from system metrics (Segoe UI on modern Windows)
+        {
+            NONCLIENTMETRICSW ncm = {};
+            ncm.cbSize = sizeof(ncm);
+            SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+            g_hFont = CreateFontIndirectW(&ncm.lfMessageFont);
+        }
+
+        // Group boxes created first so child controls render on top of them
+        g_hGrpSettings = CreateWindowEx(0, L"BUTTON", L"Output Settings",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_SETTINGS, GetModuleHandle(nullptr), nullptr);
+        g_hGrpRange = CreateWindowEx(0, L"BUTTON", L"Range",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_RANGE, GetModuleHandle(nullptr), nullptr);
+        g_hGrpResolution = CreateWindowEx(0, L"BUTTON", L"Resolution",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_RESOLUTION, GetModuleHandle(nullptr), nullptr);
+        g_hGrpPlayer = CreateWindowEx(0, L"BUTTON", L"Player",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_PLAYER, GetModuleHandle(nullptr), nullptr);
+
         g_hInfoStatic = CreateWindowEx(0, L"STATIC", L"Drop a video file onto this window",
-            WS_CHILD | WS_VISIBLE, 10, 10, 240, 20, hwnd,
+            WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 10, 10, 240, 20, hwnd,
             (HMENU)IDC_INFO_STATIC, GetModuleHandle(nullptr), nullptr);
 
         g_hSizeStatic = CreateWindowEx(0, L"STATIC", L"Target size (MB):",
@@ -332,6 +357,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessage(g_hSeekbar, TBM_SETRANGEMIN, TRUE, 0);
         SendMessage(g_hSeekbar, TBM_SETRANGEMAX, TRUE, 1000);
         SendMessage(g_hSeekbar, TBM_SETPAGESIZE, 0, 100);
+
+        // Apply UI font to every control
+        if (g_hFont) {
+            auto applyFont = [&](HWND h) { SendMessage(h, WM_SETFONT, (WPARAM)g_hFont, FALSE); };
+            applyFont(g_hGrpSettings);    applyFont(g_hGrpRange);
+            applyFont(g_hGrpResolution);  applyFont(g_hGrpPlayer);
+            applyFont(g_hInfoStatic);
+            applyFont(g_hSizeStatic);     applyFont(g_hSizeEdit);
+            applyFont(g_hSuffixStatic);   applyFont(g_hSuffixEdit);
+            applyFont(g_hRangeFullRadio); applyFont(g_hRangeCustomRadio);
+            applyFont(g_hStartStatic);    applyFont(g_hStartEdit);
+            applyFont(g_hEndStatic);      applyFont(g_hEndEdit);
+            applyFont(g_hFullRadio);      applyFont(g_hHalfRadio);   applyFont(g_hQuarterRadio);
+            applyFont(g_hStartButton);
+            applyFont(g_hBtnPlayPause);   applyFont(g_hBtnBack);
+            applyFont(g_hBtnFwd);         applyFont(g_hBtnMarkIn);   applyFont(g_hBtnMarkOut);
+        }
 
         break;
     }
@@ -433,14 +475,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_HSCROLL: {
         if ((HWND)lParam == g_hSeekbar && g_playerReady) {
-            if (LOWORD(wParam) == TB_THUMBTRACK || LOWORD(wParam) == TB_ENDTRACK ||
-                LOWORD(wParam) == SB_LINELEFT || LOWORD(wParam) == SB_LINERIGHT ||
-                LOWORD(wParam) == SB_PAGELEFT || LOWORD(wParam) == SB_PAGERIGHT) {
+            WORD code = LOWORD(wParam);
+
+            if (code == TB_THUMBTRACK) {
+                // While dragging: keep the slider thumb free – don't decode.
+                g_isDragging = true;
+            }
+            else if (code == TB_ENDTRACK) {
+                if (g_isDragging) {
+                    // Mouse released – now decode the frame at the resting position.
+                    g_isDragging = false;
+                    int pos = (int)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
+                    g_isGenerating = true;
+                    EnsureThreadRunningPaused(hwnd);
+                    SeekMs(pos, !g_isPlaying);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
+            else if (code == SB_LINELEFT || code == SB_LINERIGHT ||
+                     code == SB_PAGELEFT || code == SB_PAGERIGHT) {
+                // Arrow-key / click-on-track: decode immediately.
                 int pos = (int)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
-                bool wantSingle = !g_isPlaying;
+                g_isGenerating = true;
                 EnsureThreadRunningPaused(hwnd);
-                SeekMs(pos, wantSingle);
-                InvalidateRect(hwnd, nullptr, TRUE);
+                SeekMs(pos, !g_isPlaying);
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
         }
         break;
@@ -554,6 +613,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_APP_FRAME_READY: {
+        g_isGenerating = false;
         InvalidateRect(hwnd, nullptr, FALSE);
         break;
     }
@@ -561,7 +621,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER: {
         if (wParam == IDT_UI_REFRESH) {
             UpdateSeekbarFromPos();
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_isPlaying) InvalidateRect(hwnd, nullptr, FALSE);
         }
         break;
     }
@@ -570,7 +630,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        if (g_hFrameBitmap) {
+        if (g_hFrameBitmap || g_isGenerating) {
             RECT clientRect; GetClientRect(hwnd, &clientRect);
 
             RECT sbRect;
@@ -583,20 +643,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int availW = clientRect.right - margin * 2;
             int availH = clientRect.bottom - topY - margin;
             if (availW > 0 && availH > 0) {
-                double imgAR = (double)g_frameWidth / (double)g_frameHeight;
-                int destW = availW;
-                int destH = (int)(availW / imgAR);
-                if (destH > availH) { destH = availH; destW = (int)(availH * imgAR); }
-                int destX = (clientRect.right - destW) / 2;
-                int destY = topY;
+                if (g_isGenerating) {
+                    RECT msgRect = { margin, topY, clientRect.right - margin, clientRect.bottom - margin };
+                    HFONT oldFont = g_hFont ? (HFONT)SelectObject(hdc, g_hFont) : nullptr;
+                    SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+                    SetBkMode(hdc, TRANSPARENT);
+                    DrawTextW(hdc, L"Screenshot generating...", -1, &msgRect,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    if (oldFont) SelectObject(hdc, oldFont);
+                }
+                else {
+                    double imgAR = (double)g_frameWidth / (double)g_frameHeight;
+                    int destW = availW;
+                    int destH = (int)(availW / imgAR);
+                    if (destH > availH) { destH = availH; destW = (int)(availH * imgAR); }
+                    int destX = (clientRect.right - destW) / 2;
+                    int destY = topY;
 
-                HDC memDC = CreateCompatibleDC(hdc);
-                HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, g_hFrameBitmap);
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, nullptr);
-                StretchBlt(hdc, destX, destY, destW, destH, memDC, 0, 0, g_frameWidth, g_frameHeight, SRCCOPY);
-                SelectObject(memDC, oldBmp);
-                DeleteDC(memDC);
+                    HDC memDC = CreateCompatibleDC(hdc);
+                    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, g_hFrameBitmap);
+                    SetStretchBltMode(hdc, HALFTONE);
+                    SetBrushOrgEx(hdc, 0, 0, nullptr);
+                    StretchBlt(hdc, destX, destY, destW, destH, memDC, 0, 0, g_frameWidth, g_frameHeight, SRCCOPY);
+                    SelectObject(memDC, oldBmp);
+                    DeleteDC(memDC);
+                }
             }
         }
 
@@ -607,6 +678,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         StopPlayback();
         if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
+        if (g_hFont) { DeleteObject(g_hFont); g_hFont = nullptr; }
         PostQuitMessage(0);
         break;
 
@@ -1042,10 +1114,22 @@ void StopPlayback() {
 }
 
 void TogglePlayPause(HWND hwnd) {
+    int64_t sliderPos = (int64_t)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
     if (!g_hPlaybackThread) {
+        // Sync g_currentPosMs to the slider before the thread starts so the
+        // first timer tick never sees a stale value and snaps the slider back.
+        g_currentPosMs = sliderPos;
+        g_seekTargetMs = sliderPos;
+        g_seekRequested = true;
         StartPlayback(hwnd);
         SetWindowTextW(g_hBtnPlayPause, L"Pause");
         return;
+    }
+    if (!g_isPlaying) {
+        // Resuming from pause — play from wherever the slider currently sits,
+        // not from the last decoded frame position.
+        g_currentPosMs = sliderPos;
+        SeekMs(sliderPos, false);
     }
     g_isPlaying = !g_isPlaying;
     SetWindowTextW(g_hBtnPlayPause, g_isPlaying ? L"Pause" : L"Play");
@@ -1067,7 +1151,10 @@ void StepForward(HWND hwnd) {
     g_isPlaying = false;
     int frameMs = (int)max(1.0, 1000.0 / g_videoFPS);
     g_stepDir = +1;
-    SeekMs(g_currentPosMs + frameMs, true);
+    int64_t target = g_currentPosMs + frameMs;
+    SeekMs(target, true);
+    int64_t durMs = (int64_t)(g_duration * 1000.0);
+    SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, (LPARAM)min(target, durMs));
 }
 
 
@@ -1079,11 +1166,14 @@ void StepBackward(HWND hwnd) {
     // Seek slightly earlier than one frame to ensure we land before target and then walk forward
     int64_t target = (g_currentPosMs > frameMs * 2) ? (g_currentPosMs - frameMs * 2) : 0;
     SeekMs(target, true);
+    SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, (LPARAM)max((int64_t)0, target));
 }
 
 
 void UpdateSeekbarFromPos() {
-    if (!g_playerReady) return;
+    // Only auto-advance the slider during active playback.
+    // When paused the slider belongs to the user and is never moved by the timer.
+    if (!g_playerReady || !g_isPlaying || g_isDragging) return;
     int pos = (int)g_currentPosMs;
     SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, pos);
 }
@@ -1145,7 +1235,7 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     {
         int64_t total_bits = (int64_t)(target_size_mb * 8.0 * 1024.0 * 1024.0);
         int64_t video_bits = (int64_t)(total_bits * 0.95);
-        target_bitrate = video_bits / (int64_t)segment_duration;
+        target_bitrate = (int64_t)(video_bits / segment_duration);
     }
     if (target_bitrate <= 0) { OutputDebugStringA("Invalid target bitrate calculated.\n"); return false; }
 
