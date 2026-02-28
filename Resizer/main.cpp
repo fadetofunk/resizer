@@ -9,6 +9,13 @@
 #include <strsafe.h>
 #include <string>
 #include <cmath>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
+#include <uxtheme.h>
+#pragma comment(lib, "uxtheme.lib")
+#include <windowsx.h>
 #include <io.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -49,10 +56,13 @@ extern "C" {
 
 #define IDT_UI_REFRESH            3001
 
+#define WM_APP_THUMBS_READY  (WM_APP + 3)
+
 #define IDC_GRP_SETTINGS          2010
 #define IDC_GRP_RANGE             2011
 #define IDC_GRP_RESOLUTION        2012
 #define IDC_GRP_PLAYER            2013
+#define IDC_RES_DROPDOWN          2014
 
 // ------------------------------ Globals ------------------------------
 #define WM_APP_FRAME_READY (WM_APP + 1)
@@ -79,7 +89,15 @@ static HWND     g_hHalfRadio = nullptr;
 static HWND     g_hQuarterRadio = nullptr;
 static HWND     g_hStartButton = nullptr;
 
-static HWND     g_hSeekbar = nullptr;
+static HWND     g_hTimeline = nullptr;   // custom filmstrip seekbar
+static int      g_tlPos     = 0;         // current position in ms
+static int      g_tlMax     = 1000;      // duration in ms
+static bool     g_tlEnabled = false;
+
+static HBITMAP  g_thumbs[21] = {};       // filmstrip thumbnails (0%..100% in 5% steps)
+static int      g_thumbW = 0, g_thumbH = 0;
+static HANDLE   g_thumbThread   = nullptr;
+static volatile bool g_thumbThreadStop = false;
 static HWND     g_hBtnPlayPause = nullptr;
 static HWND     g_hBtnFwd = nullptr;
 static HWND     g_hBtnBack = nullptr;
@@ -91,6 +109,27 @@ static HWND     g_hGrpRange      = nullptr;
 static HWND     g_hGrpResolution = nullptr;
 static HWND     g_hGrpPlayer     = nullptr;
 static HFONT    g_hFont          = nullptr;
+static HFONT    g_hLabelFont     = nullptr;  // semibold variant for labels/radios
+static HWND     g_hResDrop       = nullptr;  // owner-draw resolution dropdown button
+static int      g_resSelection   = 0;        // 0=Full, 1=Half, 2=Quarter
+static ULONG_PTR g_gdiplusToken  = 0;
+static HWND      g_hTooltip      = nullptr;
+
+// ------------------------------ Theme ------------------------------
+struct AppTheme {
+    COLORREF bk;           // window / panel background
+    COLORREF editBk;       // edit control background
+    COLORREF text;         // primary text (labels, group captions)
+    COLORREF editText;     // edit control text
+    COLORREF pillNormal;   // owner-draw button pill — normal
+    COLORREF pillPressed;  // owner-draw button pill — pressed
+    COLORREF pillDisabled; // owner-draw button pill — disabled
+    COLORREF pillBorder;   // pill border (as COLORREF; alpha applied in drawing)
+};
+static bool     g_darkMode  = false;
+static AppTheme g_theme     = {};
+static HBRUSH   g_hBkBrush  = nullptr;   // window background brush
+static HBRUSH   g_hEditBrush = nullptr;  // edit control background brush
 
 static HBITMAP  g_hFrameBitmap = nullptr;
 static int      g_frameWidth = 0;
@@ -112,7 +151,12 @@ static bool         g_isGenerating = false; // true while a seek-frame decode is
 
 // Forward declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK TimelineWndProc(HWND, UINT, WPARAM, LPARAM);
+static bool IsSystemDarkMode();
+static void ApplyTheme(HWND hwnd);
 void HandleResize(HWND hwnd, int clientW, int clientH);
+static HBITMAP ExtractFrameAtTime(const char* filepath, double timeSecs);
+static unsigned __stdcall ThumbExtractThreadProc(void* param);
 bool GetVideoInfo(const char* filepath, int& width, int& height, double& durationSeconds);
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
@@ -159,41 +203,42 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     }
     y += settingsH + M;
 
-    // === Range ===
+    // === Range (now includes resolution dropdown on the right) ===
     int rangeH = GH + P + RH + P;
     MoveWindow(g_hGrpRange, M, y, clientW - M * 2, rangeH, TRUE);
     {
-        int ix = M + P, iy = y + GH;
-        int radioW = 115, labelW = 65, editW = 80;
-        MoveWindow(g_hRangeFullRadio,   ix,                           iy, radioW, RH, TRUE);
-        MoveWindow(g_hRangeCustomRadio, ix + radioW + 8,              iy, radioW, RH, TRUE);
-        int x2 = ix + radioW * 2 + 24;
-        MoveWindow(g_hStartStatic, x2,                                iy, labelW, RH, TRUE);
-        MoveWindow(g_hStartEdit,   x2 + labelW,                       iy, editW,  RH, TRUE);
-        MoveWindow(g_hEndStatic,   x2 + labelW + editW + 8,           iy, labelW, RH, TRUE);
-        MoveWindow(g_hEndEdit,     x2 + labelW * 2 + editW + 8,       iy, editW,  RH, TRUE);
+        int ix    = M + P, iy = y + GH;
+        int innerW = clientW - M * 2 - P * 2;
+        int rightIx = ix + innerW;
+
+        // Resolution dropdown fixed on the far right
+        const int dropW = 148;
+        MoveWindow(g_hResDrop, rightIx - dropW, iy, dropW, RH, TRUE);
+
+        // Range radios on the left
+        const int radioW1 = 105, radioW2 = 120, gapR = 10;
+        MoveWindow(g_hRangeFullRadio,   ix,                   iy, radioW1, RH, TRUE);
+        MoveWindow(g_hRangeCustomRadio, ix + radioW1 + gapR,  iy, radioW2, RH, TRUE);
+
+        // Start / End fields in the middle, labels wide enough to not clip
+        int midLeft  = ix + radioW1 + gapR + radioW2 + 12;
+        int midRight = rightIx - dropW - 10;
+        int midW     = midRight - midLeft;
+        const int labelW = 90;
+        int editW = max(40, (midW - labelW * 2 - 8) / 2);
+        MoveWindow(g_hStartStatic, midLeft,                             iy, labelW, RH, TRUE);
+        MoveWindow(g_hStartEdit,   midLeft + labelW,                    iy, editW,  RH, TRUE);
+        MoveWindow(g_hEndStatic,   midLeft + labelW + editW + 8,        iy, labelW, RH, TRUE);
+        MoveWindow(g_hEndEdit,     midLeft + labelW * 2 + editW + 8,    iy, editW,  RH, TRUE);
     }
     y += rangeH + M;
-
-    // === Resolution ===
-    int resH = GH + P + RH + P;
-    MoveWindow(g_hGrpResolution, M, y, clientW - M * 2, resH, TRUE);
-    {
-        int ix    = M + P, iy = y + GH;
-        int avail = clientW - M * 2 - P * 2;
-        int each  = (avail - 20) / 3;
-        MoveWindow(g_hFullRadio,    ix,                   iy, each, RH, TRUE);
-        MoveWindow(g_hHalfRadio,    ix + each + 10,       iy, each, RH, TRUE);
-        MoveWindow(g_hQuarterRadio, ix + (each + 10) * 2, iy, each, RH, TRUE);
-    }
-    y += resH + M;
 
     // === Start button ===
     MoveWindow(g_hStartButton, M, y, clientW - M * 2, 32, TRUE);
     y += 32 + M;
 
     // === Player ===
-    const int btnW = 90, btnH = 28, seekH = 28;
+    const int btnW = 90, btnH = 28, seekH = 72;
     int playerH = GH + P + btnH + 6 + seekH + P;
     MoveWindow(g_hGrpPlayer, M, y, clientW - M * 2, playerH, TRUE);
     {
@@ -205,7 +250,7 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         MoveWindow(g_hBtnMarkIn,    ix + (btnW + 6) * 3 + 16, iy, btnW, btnH, TRUE);
         MoveWindow(g_hBtnMarkOut,   ix + (btnW + 6) * 4 + 16, iy, btnW, btnH, TRUE);
         iy += btnH + 6;
-        MoveWindow(g_hSeekbar, ix, iy, avail, seekH, TRUE);
+        MoveWindow(g_hTimeline, ix, iy, avail, seekH, TRUE);
     }
     // frame preview fills remaining client area below the player group
 
@@ -214,8 +259,21 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
 
 // ------------------------------ App Entry ------------------------------
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    Gdiplus::GdiplusStartupInput gdiplusInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
+
     INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icex);
+
+    // Register custom timeline window class
+    {
+        WNDCLASS wct = {};
+        wct.lpfnWndProc   = TimelineWndProc;
+        wct.hInstance     = hInstance;
+        wct.lpszClassName = L"ResizerTimeline";
+        wct.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClass(&wct);
+    }
 
     const wchar_t CLASS_NAME[] = L"FFmpegDragDropClass";
     WNDCLASS wc = {};
@@ -223,7 +281,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = nullptr;  // WM_ERASEBKGND handled manually for theme support
 
     if (!RegisterClass(&wc)) {
         MessageBox(nullptr, L"Failed to register window class.", L"Error", MB_ICONERROR);
@@ -232,7 +290,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_mainHwnd = CreateWindowEx(
         0, CLASS_NAME, L"Resizer",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1000, 760,
         nullptr, nullptr, hInstance, nullptr
     );
@@ -241,6 +299,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return 0;
     }
 
+    ApplyTheme(g_mainHwnd);   // sets colours and dark title bar before first paint
     InitializeCriticalSection(&g_csState);
 
     ShowWindow(g_mainHwnd, nCmdShow);
@@ -253,7 +312,270 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     DeleteCriticalSection(&g_csState);
+    if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return (int)msg.wParam;
+}
+
+// ------------------------------ Theme Implementation ------------------------------
+static inline Gdiplus::Color GdipColor(COLORREF c, BYTE a = 255) {
+    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
+}
+
+static bool IsSystemDarkMode() {
+    DWORD value = 1, size = sizeof(value);
+    RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return value == 0;
+}
+
+static void ApplyTheme(HWND hwnd) {
+    g_darkMode = IsSystemDarkMode();
+
+    if (g_hBkBrush)   { DeleteObject(g_hBkBrush);   g_hBkBrush   = nullptr; }
+    if (g_hEditBrush) { DeleteObject(g_hEditBrush); g_hEditBrush = nullptr; }
+
+    if (g_darkMode) {
+        g_theme = {
+            RGB( 28,  28,  32),   // bk
+            RGB( 44,  44,  50),   // editBk
+            RGB(218, 220, 226),   // text
+            RGB(208, 210, 218),   // editText
+            RGB( 58,  60,  74),   // pillNormal
+            RGB( 28,  30,  40),   // pillPressed
+            RGB( 45,  47,  55),   // pillDisabled
+            RGB(150, 152, 170),   // pillBorder
+        };
+    } else {
+        g_theme = {
+            RGB(235, 235, 240),   // bk
+            RGB(255, 255, 255),   // editBk
+            RGB( 22,  22,  28),   // text
+            RGB( 15,  15,  20),   // editText
+            RGB(155, 158, 178),   // pillNormal
+            RGB(120, 123, 142),   // pillPressed
+            RGB(195, 197, 210),   // pillDisabled
+            RGB(100, 102, 122),   // pillBorder
+        };
+    }
+
+    g_hBkBrush   = CreateSolidBrush(g_theme.bk);
+    g_hEditBrush = CreateSolidBrush(g_theme.editBk);
+
+    // Dark/light title bar (Windows 10 20H1+ attribute 20; fall back to 19)
+    BOOL dm = g_darkMode ? TRUE : FALSE;
+    if (DwmSetWindowAttribute(hwnd, 20, &dm, sizeof(dm)) != S_OK)
+        DwmSetWindowAttribute(hwnd, 19, &dm, sizeof(dm));
+
+    // Opt every control into the correct visual style so borders, radio dots
+    // and scrollbars all render in the right mode — not just their text/fill.
+    if (hwnd) {
+        LPCWSTR editTheme   = g_darkMode ? L"DarkMode_CFD"      : L"";
+        LPCWSTR ctrlTheme   = g_darkMode ? L"DarkMode_Explorer"  : L"";
+
+        // Group boxes — border + caption in correct colour
+        if (g_hGrpSettings)   SetWindowTheme(g_hGrpSettings,   ctrlTheme, nullptr);
+        if (g_hGrpRange)      SetWindowTheme(g_hGrpRange,       ctrlTheme, nullptr);
+        if (g_hGrpResolution) SetWindowTheme(g_hGrpResolution,  ctrlTheme, nullptr);
+        if (g_hGrpPlayer)     SetWindowTheme(g_hGrpPlayer,      ctrlTheme, nullptr);
+
+        // Edit controls — border + scrollbar rendered dark
+        if (g_hSizeEdit)   SetWindowTheme(g_hSizeEdit,   editTheme, nullptr);
+        if (g_hSuffixEdit) SetWindowTheme(g_hSuffixEdit, editTheme, nullptr);
+        if (g_hStartEdit)  SetWindowTheme(g_hStartEdit,  editTheme, nullptr);
+        if (g_hEndEdit)    SetWindowTheme(g_hEndEdit,    editTheme, nullptr);
+
+        // Radio buttons — dot, circle and text rendered in correct mode
+        if (g_hRangeFullRadio)   SetWindowTheme(g_hRangeFullRadio,   ctrlTheme, nullptr);
+        if (g_hRangeCustomRadio) SetWindowTheme(g_hRangeCustomRadio, ctrlTheme, nullptr);
+    }
+
+    // Repaint everything
+    RedrawWindow(hwnd, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+// ------------------------------ Player Button Icons ------------------------------
+static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
+    bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
+    bool disabled = (dis->itemState & ODS_DISABLED)  != 0;
+
+    int W = dis->rcItem.right  - dis->rcItem.left;
+    int H = dis->rcItem.bottom - dis->rcItem.top;
+    float cx = W * 0.5f + (pressed ? 0.5f : 0.0f);
+    float cy = H * 0.5f + (pressed ? 0.5f : 0.0f);
+
+    UINT id = GetDlgCtrlID(dis->hwndItem);
+
+    // Erase the full rect first (clears corners outside any shape)
+    FillRect(dis->hDC, &dis->rcItem, g_hBkBrush ? g_hBkBrush : GetSysColorBrush(COLOR_WINDOW));
+
+    Gdiplus::Graphics g(dis->hDC);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+    float bx = 1.0f, by = 1.0f;
+    float bw = (float)W - 2.0f, bh = (float)H - 2.0f;
+
+    // ---- Start Processing button — teal gradient with text ----
+    if (id == IDC_START_BUTTON) {
+        float r = 8.0f;
+        Gdiplus::GraphicsPath path;
+        path.AddArc(bx,          by, r*2.0f, bh, 90.0f, 180.0f);
+        path.AddArc(bx+bw-r*2.0f, by, r*2.0f, bh, 270.0f, 180.0f);
+        path.CloseFigure();
+
+        Gdiplus::Color c1, c2;
+        if      (disabled) { c1 = Gdiplus::Color(255, 34, 50, 48); c2 = Gdiplus::Color(255, 26, 38, 36); }
+        else if (pressed)  { c1 = Gdiplus::Color(255, 16, 108, 98); c2 = Gdiplus::Color(255, 12, 84, 76); }
+        else               { c1 = Gdiplus::Color(255, 28, 152, 138); c2 = Gdiplus::Color(255, 20, 118, 106); }
+
+        Gdiplus::LinearGradientBrush lgb(
+            Gdiplus::PointF(0.0f, by), Gdiplus::PointF(0.0f, by + bh), c1, c2);
+        g.FillPath(&lgb, &path);
+        if (!disabled) {
+            Gdiplus::Pen pen(Gdiplus::Color(90, 100, 255, 220), 1.0f);
+            g.DrawPath(&pen, &path);
+        }
+
+        BYTE ta = disabled ? 85 : 235;
+        Gdiplus::SolidBrush tb(Gdiplus::Color(ta, 220, 255, 248));
+        HFONT hf = g_hFont ? g_hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        Gdiplus::Font font(dis->hDC, hf);
+        Gdiplus::RectF tr(bx, by, bw, bh);
+        Gdiplus::StringFormat sf;
+        sf.SetAlignment(Gdiplus::StringAlignmentCenter);
+        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        g.DrawString(L"\u25B6\u2006Start Processing", -1, &font, tr, &sf, &tb);
+        return;
+    }
+
+    // ---- Resolution dropdown button ----
+    if (id == IDC_RES_DROPDOWN) {
+        float r  = H * 0.5f - 1.0f;
+        Gdiplus::Color bgCol = disabled ? GdipColor(g_theme.pillDisabled)
+                             : pressed  ? GdipColor(g_theme.pillPressed)
+                                        : GdipColor(g_theme.pillNormal);
+        {
+            Gdiplus::GraphicsPath path;
+            path.AddArc(bx, by, r*2.0f, bh, 90.0f, 180.0f);
+            path.AddArc(bx+bw-r*2.0f, by, r*2.0f, bh, 270.0f, 180.0f);
+            path.CloseFigure();
+            Gdiplus::SolidBrush b(bgCol);
+            g.FillPath(&b, &path);
+            if (!disabled) {
+                Gdiplus::Pen pen(GdipColor(g_theme.pillBorder, 80), 1.0f);
+                g.DrawPath(&pen, &path);
+            }
+        }
+
+        BYTE a = disabled ? 65 : (pressed ? 195 : 228);
+        // Build label: "Full 1920×1080" etc.
+        wchar_t resText[48];
+        const wchar_t* labels[] = { L"Full", L"Half", L"Quarter" };
+        if (g_vidWidth > 0) {
+            int dw = g_vidWidth  >> g_resSelection;
+            int dh = g_vidHeight >> g_resSelection;
+            StringCchPrintfW(resText, 48, L"%s  %d\u00D7%d", labels[g_resSelection], dw, dh);
+        } else {
+            StringCchCopyW(resText, 48, labels[g_resSelection]);
+        }
+
+        float chevW = 18.0f;
+        HFONT hf = g_hFont ? g_hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        Gdiplus::Font font(dis->hDC, hf);
+        Gdiplus::SolidBrush tb(Gdiplus::Color(a, 215, 220, 232));
+        Gdiplus::RectF textRect(bx + 10.0f, by, bw - chevW - 10.0f, bh);
+        Gdiplus::StringFormat sf;
+        sf.SetAlignment(Gdiplus::StringAlignmentNear);
+        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        g.DrawString(resText, -1, &font, textRect, &sf, &tb);
+
+        // Chevron ▼
+        float cy2 = H * 0.5f;
+        float cvx = bx + bw - chevW * 0.5f - 2.0f;
+        Gdiplus::SolidBrush cb(Gdiplus::Color(a, 150, 155, 175));
+        Gdiplus::PointF chevPts[3] = { {cvx-4.5f, cy2-2.5f}, {cvx+4.5f, cy2-2.5f}, {cvx, cy2+3.0f} };
+        g.FillPolygon(&cb, chevPts, 3);
+        return;
+    }
+
+    // ---- Player icon buttons — pill ----
+    float r  = H * 0.5f - 1.0f;
+
+    {
+        Gdiplus::Color bgCol = disabled ? GdipColor(g_theme.pillDisabled)
+                             : pressed  ? GdipColor(g_theme.pillPressed)
+                                        : GdipColor(g_theme.pillNormal);
+        Gdiplus::GraphicsPath path;
+        path.AddArc(bx,                  by, r * 2.0f, bh, 90.0f, 180.0f);
+        path.AddArc(bx + bw - r * 2.0f, by, r * 2.0f, bh, 270.0f, 180.0f);
+        path.CloseFigure();
+        Gdiplus::SolidBrush b(bgCol);
+        g.FillPath(&b, &path);
+        if (!disabled) {
+            Gdiplus::Pen pen(GdipColor(g_theme.pillBorder, 80), 1.0f);
+            g.DrawPath(&pen, &path);
+        }
+    }
+
+    BYTE a = disabled ? 65 : (pressed ? 195 : 228);
+
+    if (id == IDC_BTN_PLAYPAUSE) {
+        if (g_isPlaying) {
+            // Pause — two amber bars
+            Gdiplus::SolidBrush b(Gdiplus::Color(a, 255, 198, 55));
+            float bw2 = 4.5f, bh2 = 13.0f, gap = 5.5f;
+            g.FillRectangle(&b, cx - bw2 - gap * 0.5f, cy - bh2 * 0.5f, bw2, bh2);
+            g.FillRectangle(&b, cx             + gap * 0.5f, cy - bh2 * 0.5f, bw2, bh2);
+        }
+        else {
+            // Play — teal-green triangle
+            Gdiplus::SolidBrush b(Gdiplus::Color(a, 72, 220, 155));
+            Gdiplus::PointF pts[3] = { {cx-6.5f, cy-9.0f}, {cx-6.5f, cy+9.0f}, {cx+9.0f, cy} };
+            g.FillPolygon(&b, pts, 3);
+        }
+    }
+    else if (id == IDC_BTN_BACK) {
+        // |◀  coral step-back
+        Gdiplus::SolidBrush b(Gdiplus::Color(a, 255, 125, 75));
+        g.FillRectangle(&b, cx - 9.5f, cy - 8.0f, 3.5f, 16.0f);
+        Gdiplus::PointF pts[3] = { {cx-5.0f, cy}, {cx+7.5f, cy-8.0f}, {cx+7.5f, cy+8.0f} };
+        g.FillPolygon(&b, pts, 3);
+    }
+    else if (id == IDC_BTN_FWD) {
+        // ▶|  coral step-forward
+        Gdiplus::SolidBrush b(Gdiplus::Color(a, 255, 125, 75));
+        Gdiplus::PointF pts[3] = { {cx-7.5f, cy-8.0f}, {cx-7.5f, cy+8.0f}, {cx+5.0f, cy} };
+        g.FillPolygon(&b, pts, 3);
+        g.FillRectangle(&b, cx + 6.0f, cy - 8.0f, 3.5f, 16.0f);
+    }
+    else if (id == IDC_BTN_MARKIN) {
+        // [→  violet bracket + right arrow (set start)
+        Gdiplus::Color col(a, 155, 95, 255);
+        Gdiplus::Pen pen(col, 2.5f);
+        pen.SetStartCap(Gdiplus::LineCapSquare);
+        pen.SetEndCap(Gdiplus::LineCapSquare);
+        g.DrawLine(&pen, cx - 9.0f, cy - 8.0f, cx - 9.0f, cy + 8.0f);
+        g.DrawLine(&pen, cx - 9.0f, cy - 8.0f, cx - 4.5f, cy - 8.0f);
+        g.DrawLine(&pen, cx - 9.0f, cy + 8.0f, cx - 4.5f, cy + 8.0f);
+        Gdiplus::SolidBrush b(col);
+        Gdiplus::PointF pts[3] = { {cx-2.5f, cy-6.0f}, {cx-2.5f, cy+6.0f}, {cx+8.5f, cy} };
+        g.FillPolygon(&b, pts, 3);
+    }
+    else if (id == IDC_BTN_MARKOUT) {
+        // ←]  hot-pink left arrow + bracket (set end)
+        Gdiplus::Color col(a, 255, 75, 135);
+        Gdiplus::SolidBrush b(col);
+        Gdiplus::PointF pts[3] = { {cx+2.5f, cy-6.0f}, {cx+2.5f, cy+6.0f}, {cx-8.5f, cy} };
+        g.FillPolygon(&b, pts, 3);
+        Gdiplus::Pen pen(col, 2.5f);
+        pen.SetStartCap(Gdiplus::LineCapSquare);
+        pen.SetEndCap(Gdiplus::LineCapSquare);
+        g.DrawLine(&pen, cx + 9.0f, cy - 8.0f, cx + 9.0f, cy + 8.0f);
+        g.DrawLine(&pen, cx + 9.0f, cy - 8.0f, cx + 4.5f, cy - 8.0f);
+        g.DrawLine(&pen, cx + 9.0f, cy + 8.0f, cx + 4.5f, cy + 8.0f);
+    }
 }
 
 // ------------------------------ Window Proc ------------------------------
@@ -268,6 +590,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ncm.cbSize = sizeof(ncm);
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             g_hFont = CreateFontIndirectW(&ncm.lfMessageFont);
+
+            // Semibold label font — same face, slightly larger, heavier weight
+            LOGFONTW lf = ncm.lfMessageFont;
+            lf.lfWeight = FW_SEMIBOLD;
+            if (lf.lfHeight > 0) lf.lfHeight += 1; else if (lf.lfHeight < 0) lf.lfHeight -= 1;
+            g_hLabelFont = CreateFontIndirectW(&lf);
         }
 
         // Group boxes created first so child controls render on top of them
@@ -278,7 +606,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_RANGE, GetModuleHandle(nullptr), nullptr);
         g_hGrpResolution = CreateWindowEx(0, L"BUTTON", L"Resolution",
-            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            WS_CHILD | BS_GROUPBOX,   // not WS_VISIBLE — replaced by dropdown in Range group
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_RESOLUTION, GetModuleHandle(nullptr), nullptr);
         g_hGrpPlayer = CreateWindowEx(0, L"BUTTON", L"Player",
             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
@@ -323,58 +651,136 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             580, 100, 80, 20, hwnd, (HMENU)IDC_END_EDIT, GetModuleHandle(nullptr), nullptr);
 
         g_hFullRadio = CreateWindowEx(0, L"BUTTON", L"Full resolution",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON | WS_GROUP,
-            10, 130, 300, 20, hwnd, (HMENU)IDC_SCALE_FULL_RADIO, GetModuleHandle(nullptr), nullptr);
+            WS_CHILD | WS_DISABLED | BS_AUTORADIOBUTTON | WS_GROUP,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SCALE_FULL_RADIO, GetModuleHandle(nullptr), nullptr);
         g_hHalfRadio = CreateWindowEx(0, L"BUTTON", L"Half resolution",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON,
-            10, 155, 300, 20, hwnd, (HMENU)IDC_SCALE_HALF_RADIO, GetModuleHandle(nullptr), nullptr);
+            WS_CHILD | WS_DISABLED | BS_AUTORADIOBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SCALE_HALF_RADIO, GetModuleHandle(nullptr), nullptr);
         g_hQuarterRadio = CreateWindowEx(0, L"BUTTON", L"Quarter resolution",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON,
-            10, 180, 300, 20, hwnd, (HMENU)IDC_SCALE_QUARTER_RADIO, GetModuleHandle(nullptr), nullptr);
+            WS_CHILD | WS_DISABLED | BS_AUTORADIOBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SCALE_QUARTER_RADIO, GetModuleHandle(nullptr), nullptr);
+        // Hidden from here on — state is still maintained, replaced visually by g_hResDrop
+        SendMessage(g_hFullRadio, BM_SETCHECK, BST_CHECKED, 0);
 
-        g_hStartButton = CreateWindowEx(0, L"BUTTON", L"Start Processing",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_DEFPUSHBUTTON,
+        g_hResDrop = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_RES_DROPDOWN, GetModuleHandle(nullptr), nullptr);
+
+        g_hStartButton = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
             10, 210, 150, 30, hwnd, (HMENU)IDC_START_BUTTON, GetModuleHandle(nullptr), nullptr);
 
-        g_hBtnPlayPause = CreateWindowEx(0, L"BUTTON", L"Play",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED, 10, 250, 90, 26, hwnd,
+        g_hBtnPlayPause = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 10, 250, 90, 26, hwnd,
             (HMENU)IDC_BTN_PLAYPAUSE, GetModuleHandle(nullptr), nullptr);
-        g_hBtnBack = CreateWindowEx(0, L"BUTTON", L"Frame Back",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED, 110, 250, 90, 26, hwnd,
+        g_hBtnBack = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 110, 250, 90, 26, hwnd,
             (HMENU)IDC_BTN_BACK, GetModuleHandle(nullptr), nullptr);
-        g_hBtnFwd = CreateWindowEx(0, L"BUTTON", L"Frame Fwd",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED, 210, 250, 90, 26, hwnd,
+        g_hBtnFwd = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 210, 250, 90, 26, hwnd,
             (HMENU)IDC_BTN_FWD, GetModuleHandle(nullptr), nullptr);
-        g_hBtnMarkIn = CreateWindowEx(0, L"BUTTON", L"Mark In",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED, 330, 250, 90, 26, hwnd,
+        g_hBtnMarkIn = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 330, 250, 90, 26, hwnd,
             (HMENU)IDC_BTN_MARKIN, GetModuleHandle(nullptr), nullptr);
-        g_hBtnMarkOut = CreateWindowEx(0, L"BUTTON", L"Mark Out",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED, 430, 250, 90, 26, hwnd,
+        g_hBtnMarkOut = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 430, 250, 90, 26, hwnd,
             (HMENU)IDC_BTN_MARKOUT, GetModuleHandle(nullptr), nullptr);
-        g_hSeekbar = CreateWindowEx(0, TRACKBAR_CLASS, L"",
-            WS_CHILD | WS_VISIBLE | WS_DISABLED | TBS_AUTOTICKS,
-            10, 285, 600, 28, hwnd, (HMENU)IDC_SEEKBAR, GetModuleHandle(nullptr), nullptr);
-        SendMessage(g_hSeekbar, TBM_SETRANGEMIN, TRUE, 0);
-        SendMessage(g_hSeekbar, TBM_SETRANGEMAX, TRUE, 1000);
-        SendMessage(g_hSeekbar, TBM_SETPAGESIZE, 0, 100);
+        g_hTimeline = CreateWindowEx(0, L"ResizerTimeline", L"",
+            WS_CHILD | WS_VISIBLE,
+            10, 285, 600, 72, hwnd, (HMENU)IDC_SEEKBAR, GetModuleHandle(nullptr), nullptr);
 
         // Apply UI font to every control
         if (g_hFont) {
             auto applyFont = [&](HWND h) { SendMessage(h, WM_SETFONT, (WPARAM)g_hFont, FALSE); };
+            HFONT lf = g_hLabelFont ? g_hLabelFont : g_hFont;
+            auto applyLabelFont = [&](HWND h) { SendMessage(h, WM_SETFONT, (WPARAM)lf, FALSE); };
+
             applyFont(g_hGrpSettings);    applyFont(g_hGrpRange);
             applyFont(g_hGrpResolution);  applyFont(g_hGrpPlayer);
             applyFont(g_hInfoStatic);
-            applyFont(g_hSizeStatic);     applyFont(g_hSizeEdit);
-            applyFont(g_hSuffixStatic);   applyFont(g_hSuffixEdit);
-            applyFont(g_hRangeFullRadio); applyFont(g_hRangeCustomRadio);
-            applyFont(g_hStartStatic);    applyFont(g_hStartEdit);
-            applyFont(g_hEndStatic);      applyFont(g_hEndEdit);
+            applyLabelFont(g_hSizeStatic);     applyFont(g_hSizeEdit);
+            applyLabelFont(g_hSuffixStatic);   applyFont(g_hSuffixEdit);
+            applyLabelFont(g_hRangeFullRadio); applyLabelFont(g_hRangeCustomRadio);
+            applyLabelFont(g_hStartStatic);    applyFont(g_hStartEdit);
+            applyLabelFont(g_hEndStatic);      applyFont(g_hEndEdit);
             applyFont(g_hFullRadio);      applyFont(g_hHalfRadio);   applyFont(g_hQuarterRadio);
-            applyFont(g_hStartButton);
+            applyFont(g_hResDrop);
             applyFont(g_hBtnPlayPause);   applyFont(g_hBtnBack);
             applyFont(g_hBtnFwd);         applyFont(g_hBtnMarkIn);   applyFont(g_hBtnMarkOut);
         }
 
+        // Create tooltip control and register each button
+        g_hTooltip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_BALLOON,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+        SendMessage(g_hTooltip, TTM_SETMAXTIPWIDTH, 0, 300);
+        SendMessage(g_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 8000);
+
+        auto addTip = [&](HWND hCtrl, LPCWSTR text) {
+            TOOLINFOW ti = {};
+            ti.cbSize   = sizeof(ti);
+            ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+            ti.hwnd     = hwnd;
+            ti.uId      = (UINT_PTR)hCtrl;
+            ti.lpszText = const_cast<LPWSTR>(text);
+            SendMessageW(g_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        };
+        addTip(g_hStartButton,  L"Transcode video to the target file size");
+        addTip(g_hResDrop,      L"Output resolution — click to change");
+        addTip(g_hBtnPlayPause, L"Play / Pause  [Space]");
+        addTip(g_hBtnBack,      L"Step back one frame  [\u2190]");
+        addTip(g_hBtnFwd,       L"Step forward one frame  [\u2192]");
+        addTip(g_hBtnMarkIn,    L"Set clip start to current position  [I]");
+        addTip(g_hBtnMarkOut,   L"Set clip end to current position  [O]");
+
+        break;
+    }
+
+    case WM_ERASEBKGND: {
+        if (!g_hBkBrush) break;
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect((HDC)wParam, &rc, g_hBkBrush);
+        return 1;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        // Labels, info bar, group-box caption text
+        HDC hdc = (HDC)wParam;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.bk);
+        return (LRESULT)g_hBkBrush;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, g_theme.editText);
+        SetBkColor(hdc, g_theme.editBk);
+        return (LRESULT)g_hEditBrush;
+    }
+
+    case WM_CTLCOLORBTN: {
+        // Group boxes (non-owner-draw BUTTON controls)
+        HDC hdc = (HDC)wParam;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_theme.text);
+        SetBkColor(hdc, g_theme.bk);
+        return (LRESULT)g_hBkBrush;
+    }
+
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED: {
+        if (msg == WM_SETTINGCHANGE &&
+            !(lParam && lstrcmpW((LPCWSTR)lParam, L"ImmersiveColorSet") == 0))
+            break;
+        ApplyTheme(hwnd);
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlType == ODT_BUTTON) { DrawPlayerButton(dis); return TRUE; }
         break;
     }
 
@@ -387,6 +793,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DROPFILES: {
         HDROP hDrop = (HDROP)wParam;
+        // Stop any running playback from a previous file before loading the new one.
+        // Without this the old decode thread keeps writing stale frames into g_hFrameBitmap.
+        g_isPlaying = false;
+        g_playerReady = false;
+        StopPlayback();
         if (DragQueryFileA(hDrop, 0, g_inputPath, MAX_PATH)) {
             if (GetVideoInfo(g_inputPath, g_vidWidth, g_vidHeight, g_duration)) {
                 wchar_t infoText[512];
@@ -427,6 +838,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SendMessage(g_hFullRadio, BM_SETCHECK, BST_CHECKED, 0);
                 SendMessage(g_hHalfRadio, BM_SETCHECK, BST_UNCHECKED, 0);
                 SendMessage(g_hQuarterRadio, BM_SETCHECK, BST_UNCHECKED, 0);
+                g_resSelection = 0;
+                EnableWindow(g_hResDrop, TRUE);
+                InvalidateRect(g_hResDrop, nullptr, TRUE);
 
                 EnableWindow(g_hStartButton, TRUE);
 
@@ -437,17 +851,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetWindowTextW(g_hStartEdit, startBuf);
                 SetWindowTextW(g_hEndEdit, endBuf);
 
-                SendMessage(g_hSeekbar, TBM_SETRANGEMIN, TRUE, 0);
-                SendMessage(g_hSeekbar, TBM_SETRANGEMAX, TRUE, (LPARAM)(int)(g_duration * 1000));
-                SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, 0);
-                EnableWindow(g_hSeekbar, TRUE);
+                g_tlMax = (int)(g_duration * 1000);
+                g_tlPos = 0;
+                g_tlEnabled = true;
+                InvalidateRect(g_hTimeline, nullptr, TRUE);
 
                 EnableWindow(g_hBtnPlayPause, TRUE);
                 EnableWindow(g_hBtnFwd, TRUE);
                 EnableWindow(g_hBtnBack, TRUE);
                 EnableWindow(g_hBtnMarkIn, TRUE);
                 EnableWindow(g_hBtnMarkOut, TRUE);
-                SetWindowTextW(g_hBtnPlayPause, L"Play");
+                InvalidateRect(g_hBtnPlayPause, nullptr, TRUE);
+
+                // Start thumbnail extraction in background
+                g_thumbThreadStop = true;
+                if (g_thumbThread) {
+                    WaitForSingleObject(g_thumbThread, 3000);
+                    CloseHandle(g_thumbThread);
+                    g_thumbThread = nullptr;
+                }
+                for (int i = 0; i < 21; i++) {
+                    if (g_thumbs[i]) { DeleteObject(g_thumbs[i]); g_thumbs[i] = nullptr; }
+                }
+                g_thumbW = 0; g_thumbH = 0;
+                g_thumbThreadStop = false;
+                g_thumbThread = (HANDLE)_beginthreadex(nullptr, 0, ThumbExtractThreadProc, nullptr, 0, nullptr);
 
                 if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
                 g_hFrameBitmap = ExtractMiddleFrameBitmap(g_inputPath, g_vidWidth, g_vidHeight, g_duration);
@@ -473,42 +901,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
-    case WM_HSCROLL: {
-        if ((HWND)lParam == g_hSeekbar && g_playerReady) {
-            WORD code = LOWORD(wParam);
-
-            if (code == TB_THUMBTRACK) {
-                // While dragging: keep the slider thumb free – don't decode.
-                g_isDragging = true;
-            }
-            else if (code == TB_ENDTRACK) {
-                if (g_isDragging) {
-                    // Mouse released – now decode the frame at the resting position.
-                    g_isDragging = false;
-                    int pos = (int)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
-                    g_isGenerating = true;
-                    EnsureThreadRunningPaused(hwnd);
-                    SeekMs(pos, !g_isPlaying);
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                }
-            }
-            else if (code == SB_LINELEFT || code == SB_LINERIGHT ||
-                     code == SB_PAGELEFT || code == SB_PAGERIGHT) {
-                // Arrow-key / click-on-track: decode immediately.
-                int pos = (int)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
-                g_isGenerating = true;
-                EnsureThreadRunningPaused(hwnd);
-                SeekMs(pos, !g_isPlaying);
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-        }
+    case WM_APP_THUMBS_READY: {
+        InvalidateRect(g_hTimeline, nullptr, FALSE);
         break;
     }
 
     case WM_COMMAND: {
         int id = LOWORD(wParam);
 
-        if (id == IDC_RANGE_FULL_RADIO) {
+        if (id == IDC_RES_DROPDOWN) {
+            // Show resolution popup menu below the button
+            HMENU hMenu = CreatePopupMenu();
+            wchar_t lbl0[64], lbl1[64], lbl2[64];
+            if (g_vidWidth > 0) {
+                StringCchPrintfW(lbl0, 64, L"Full      %d\u00D7%d", g_vidWidth, g_vidHeight);
+                StringCchPrintfW(lbl1, 64, L"Half      %d\u00D7%d", g_vidWidth/2, g_vidHeight/2);
+                StringCchPrintfW(lbl2, 64, L"Quarter  %d\u00D7%d",  g_vidWidth/4, g_vidHeight/4);
+            } else {
+                StringCchCopyW(lbl0, 64, L"Full resolution");
+                StringCchCopyW(lbl1, 64, L"Half resolution");
+                StringCchCopyW(lbl2, 64, L"Quarter resolution");
+            }
+            AppendMenuW(hMenu, MF_STRING | (g_resSelection==0 ? MF_CHECKED : 0), 1, lbl0);
+            AppendMenuW(hMenu, MF_STRING | (g_resSelection==1 ? MF_CHECKED : 0), 2, lbl1);
+            AppendMenuW(hMenu, MF_STRING | (g_resSelection==2 ? MF_CHECKED : 0), 3, lbl2);
+            RECT btnRect; GetWindowRect(g_hResDrop, &btnRect);
+            int sel = TrackPopupMenu(hMenu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                btnRect.left, btnRect.bottom, 0, hwnd, nullptr);
+            DestroyMenu(hMenu);
+            if (sel >= 1 && sel <= 3) {
+                g_resSelection = sel - 1;
+                // Keep hidden radios in sync so existing scale-factor logic works
+                SendMessage(g_hFullRadio,    BM_SETCHECK, g_resSelection==0 ? BST_CHECKED : BST_UNCHECKED, 0);
+                SendMessage(g_hHalfRadio,    BM_SETCHECK, g_resSelection==1 ? BST_CHECKED : BST_UNCHECKED, 0);
+                SendMessage(g_hQuarterRadio, BM_SETCHECK, g_resSelection==2 ? BST_CHECKED : BST_UNCHECKED, 0);
+                InvalidateRect(g_hResDrop, nullptr, TRUE);
+            }
+        }
+        else if (id == IDC_RANGE_FULL_RADIO) {
             SendMessage(g_hRangeFullRadio, BM_SETCHECK, BST_CHECKED, 0);
             SendMessage(g_hRangeCustomRadio, BM_SETCHECK, BST_UNCHECKED, 0);
             EnableWindow(g_hStartStatic, FALSE);
@@ -634,7 +1065,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT clientRect; GetClientRect(hwnd, &clientRect);
 
             RECT sbRect;
-            GetWindowRect(g_hSeekbar, &sbRect);
+            GetWindowRect(g_hTimeline, &sbRect);
             ScreenToClient(hwnd, (POINT*)&sbRect.left);
             ScreenToClient(hwnd, (POINT*)&sbRect.right);
             int margin = 10;
@@ -646,7 +1077,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_isGenerating) {
                     RECT msgRect = { margin, topY, clientRect.right - margin, clientRect.bottom - margin };
                     HFONT oldFont = g_hFont ? (HFONT)SelectObject(hdc, g_hFont) : nullptr;
-                    SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+                    SetTextColor(hdc, g_darkMode ? RGB(140,142,150) : RGB(110,112,120));
                     SetBkMode(hdc, TRANSPARENT);
                     DrawTextW(hdc, L"Screenshot generating...", -1, &msgRect,
                               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -677,8 +1108,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         StopPlayback();
+        g_thumbThreadStop = true;
+        if (g_thumbThread) {
+            WaitForSingleObject(g_thumbThread, 3000);
+            CloseHandle(g_thumbThread);
+            g_thumbThread = nullptr;
+        }
+        for (int i = 0; i < 21; i++) {
+            if (g_thumbs[i]) { DeleteObject(g_thumbs[i]); g_thumbs[i] = nullptr; }
+        }
         if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
-        if (g_hFont) { DeleteObject(g_hFont); g_hFont = nullptr; }
+        if (g_hFont)        { DeleteObject(g_hFont);        g_hFont        = nullptr; }
+        if (g_hLabelFont)   { DeleteObject(g_hLabelFont);   g_hLabelFont   = nullptr; }
+        if (g_hBkBrush)     { DeleteObject(g_hBkBrush);    g_hBkBrush     = nullptr; }
+        if (g_hEditBrush)   { DeleteObject(g_hEditBrush);  g_hEditBrush   = nullptr; }
         PostQuitMessage(0);
         break;
 
@@ -1114,7 +1557,7 @@ void StopPlayback() {
 }
 
 void TogglePlayPause(HWND hwnd) {
-    int64_t sliderPos = (int64_t)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
+    int64_t sliderPos = (int64_t)g_tlPos;
     if (!g_hPlaybackThread) {
         // Sync g_currentPosMs to the slider before the thread starts so the
         // first timer tick never sees a stale value and snaps the slider back.
@@ -1122,7 +1565,7 @@ void TogglePlayPause(HWND hwnd) {
         g_seekTargetMs = sliderPos;
         g_seekRequested = true;
         StartPlayback(hwnd);
-        SetWindowTextW(g_hBtnPlayPause, L"Pause");
+        InvalidateRect(g_hBtnPlayPause, nullptr, TRUE);
         return;
     }
     if (!g_isPlaying) {
@@ -1132,7 +1575,7 @@ void TogglePlayPause(HWND hwnd) {
         SeekMs(sliderPos, false);
     }
     g_isPlaying = !g_isPlaying;
-    SetWindowTextW(g_hBtnPlayPause, g_isPlaying ? L"Pause" : L"Play");
+    InvalidateRect(g_hBtnPlayPause, nullptr, TRUE);
 }
 
 void SeekMs(int64_t ms, bool decodeSingle) {
@@ -1154,7 +1597,8 @@ void StepForward(HWND hwnd) {
     int64_t target = g_currentPosMs + frameMs;
     SeekMs(target, true);
     int64_t durMs = (int64_t)(g_duration * 1000.0);
-    SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, (LPARAM)min(target, durMs));
+    g_tlPos = (int)min(target, durMs);
+    InvalidateRect(g_hTimeline, nullptr, FALSE);
 }
 
 
@@ -1166,7 +1610,8 @@ void StepBackward(HWND hwnd) {
     // Seek slightly earlier than one frame to ensure we land before target and then walk forward
     int64_t target = (g_currentPosMs > frameMs * 2) ? (g_currentPosMs - frameMs * 2) : 0;
     SeekMs(target, true);
-    SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, (LPARAM)max((int64_t)0, target));
+    g_tlPos = (int)max((int64_t)0, target);
+    InvalidateRect(g_hTimeline, nullptr, FALSE);
 }
 
 
@@ -1174,8 +1619,8 @@ void UpdateSeekbarFromPos() {
     // Only auto-advance the slider during active playback.
     // When paused the slider belongs to the user and is never moved by the timer.
     if (!g_playerReady || !g_isPlaying || g_isDragging) return;
-    int pos = (int)g_currentPosMs;
-    SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, pos);
+    g_tlPos = (int)g_currentPosMs;
+    InvalidateRect(g_hTimeline, nullptr, FALSE);
 }
 
 void SetMarkInFromCurrent(HWND hwnd) {
@@ -1410,4 +1855,371 @@ cleanup:
         avformat_free_context(out_fmt_ctx);
     }
     return success;
+}
+
+// ------------------------------ Filmstrip Thumbnail Extraction ------------------------------
+// ----- HDR → SDR tone-mapping helpers ----------------------------------------
+
+// Guard for older FFmpeg builds that don't define SWS_CS_BT2020
+#ifndef SWS_CS_BT2020
+#define SWS_CS_BT2020 9
+#endif
+
+// PQ (SMPTE ST 2084) EOTF: normalised signal [0,1] → linear light [0,1]
+// where 1.0 represents 10 000 nits.
+static double pq_eotf(double N) {
+    if (N <= 0.0) return 0.0;
+    const double m1 = 0.1593017578125, m2 = 78.84375;
+    const double c1 = 0.8359375,       c2 = 18.8515625, c3 = 18.6875;
+    double p   = pow(N, 1.0 / m2);
+    double num = p - c1; if (num < 0.0) num = 0.0;
+    double den = c2 - c3 * p;
+    return den > 0.0 ? pow(num / den, 1.0 / m1) : 0.0;
+}
+
+// HLG (ARIB STD-B67) OETF inverse: normalised signal [0,1] → scene-linear [0,1]
+static double hlg_eotf(double E) {
+    if (E < 0.0) return 0.0;
+    if (E <= 0.5) return (E * E) / 3.0;
+    const double a = 0.17883277, b = 0.28466892, c = 0.55991073;
+    return (exp((E - c) / a) + b) / 12.0;
+}
+
+// Extended Reinhard tone mapping (per-channel in linear light).
+// white: reference white in the same linear units as v.
+static inline double reinhard_tm(double v, double white) {
+    return v * (1.0 + v / (white * white)) / (1.0 + v);
+}
+
+// sRGB OETF: linear [0,1] → gamma-encoded [0,255] uint8
+static inline uint8_t srgb_pack(double v) {
+    double g = (v <= 0.0031308) ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+    int i = (int)(g * 255.0 + 0.5);
+    return (uint8_t)(i < 0 ? 0 : i > 255 ? 255 : i);
+}
+
+// BT.2020 linear RGB → BT.709 linear RGB primaries matrix
+static const double k_bt2020_to_bt709[3][3] = {
+    { 1.6605, -0.5876, -0.0728 },
+    {-0.1246,  1.1329, -0.0083 },
+    {-0.0182, -0.1006,  1.1187 }
+};
+
+static HBITMAP ExtractFrameAtTime(const char* filepath, double timeSecs) {
+    AVFormatContext* fmt_ctx = nullptr;
+    AVCodecContext*  dec_ctx = nullptr;
+    SwsContext*      sws_ctx = nullptr;
+    AVPacket*        pkt     = nullptr;
+    AVFrame*         frame   = nullptr;
+    AVFrame*         rgbFrame = nullptr;
+    uint8_t*         rgbBuffer = nullptr;
+    HBITMAP          hBitmap = nullptr;
+    int              videoIdx = -1;
+    bool             gotFrame = false;
+
+    if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) goto tf_cleanup;
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) goto tf_cleanup;
+    for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { videoIdx = i; break; }
+    }
+    if (videoIdx < 0) goto tf_cleanup;
+    {
+        AVStream* vs = fmt_ctx->streams[videoIdx];
+        const AVCodec* dec = avcodec_find_decoder(vs->codecpar->codec_id);
+        if (!dec) goto tf_cleanup;
+        dec_ctx = avcodec_alloc_context3(dec);
+        if (!dec_ctx) goto tf_cleanup;
+        if (avcodec_parameters_to_context(dec_ctx, vs->codecpar) < 0) goto tf_cleanup;
+        if (avcodec_open2(dec_ctx, dec, nullptr) < 0) goto tf_cleanup;
+
+        // Compute thumbnail size preserving aspect ratio, capped at 160×90
+        int srcW = dec_ctx->width, srcH = dec_ctx->height;
+        int dstH = 90;
+        int dstW = (srcH > 0) ? (int)((double)srcW / srcH * dstH) : 160;
+        if (dstW < 1) dstW = 1;
+        // Store thumb dimensions on first call (all frames same source size)
+        if (g_thumbW == 0) { g_thumbW = dstW; g_thumbH = dstH; }
+
+        // sws_ctx is created after decoding the first frame so we can use
+        // frame->format (the decoder's actual output format) rather than
+        // dec_ctx->pix_fmt, which may be wrong for 10-bit HEVC before decoding.
+        int bufSize = av_image_get_buffer_size(AV_PIX_FMT_BGR24, dstW, dstH, 1);
+        rgbBuffer = (uint8_t*)av_malloc(bufSize);
+        frame    = av_frame_alloc();
+        rgbFrame = av_frame_alloc();
+        pkt      = av_packet_alloc();
+        if (!rgbBuffer || !frame || !rgbFrame || !pkt) goto tf_cleanup;
+        av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, rgbBuffer,
+            AV_PIX_FMT_BGR24, dstW, dstH, 1);
+
+        int64_t seek_ts = (int64_t)(timeSecs * AV_TIME_BASE);
+        av_seek_frame(fmt_ctx, -1, seek_ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(dec_ctx);
+
+        // Seek lands on the nearest keyframe *before* timeSecs.  If we take the
+        // very first decoded frame we always get that keyframe, so every thumbnail
+        // within the same GOP (often 2-10 s) looks identical.  Instead, decode
+        // forward and skip frames until we reach the requested timestamp.
+        double   tbase     = av_q2d(vs->time_base);
+        bool     frameDone = false;
+
+        while (!g_thumbThreadStop && !frameDone && av_read_frame(fmt_ctx, pkt) >= 0) {
+            if (pkt->stream_index == videoIdx &&
+                avcodec_send_packet(dec_ctx, pkt) == 0) {
+
+                while (!frameDone && avcodec_receive_frame(dec_ctx, frame) == 0) {
+                    // Convert frame PTS to seconds; prefer best_effort_timestamp.
+                    int64_t pts = frame->best_effort_timestamp;
+                    if (pts == AV_NOPTS_VALUE) pts = frame->pts;
+                    double fSecs = (pts != AV_NOPTS_VALUE)
+                        ? (double)pts * tbase
+                        : timeSecs; // PTS unknown — accept whatever we have
+
+                    if (fSecs + 0.001 >= timeSecs) {
+                        // This frame is at or past the target time — process it.
+                        frameDone = true;
+
+                        AVPixelFormat srcFmt = (AVPixelFormat)frame->format;
+                        bool isPQ  = (frame->color_trc == AVCOL_TRC_SMPTE2084);
+                        bool isHLG = (frame->color_trc == AVCOL_TRC_ARIB_STD_B67);
+
+                        if (isPQ || isHLG) {
+                            // --- HDR path: decode → RGB48LE → EOTF → TM → sRGB → BGR24 ---
+                            int srcCs = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
+                                         frame->colorspace == AVCOL_SPC_BT2020_CL)
+                                        ? SWS_CS_BT2020 : SWS_CS_ITU709;
+                            int srcRange = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+
+                            SwsContext* hdr_sws = sws_getContext(
+                                srcW, srcH, srcFmt,
+                                dstW, dstH, AV_PIX_FMT_RGB48LE,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (hdr_sws) {
+                                sws_setColorspaceDetails(hdr_sws,
+                                    sws_getCoefficients(srcCs),    srcRange,
+                                    sws_getCoefficients(SWS_CS_ITU709), 1,
+                                    0, 1 << 16, 1 << 16);
+
+                                int rgb48Stride = dstW * 6;
+                                uint8_t* rgb48 = (uint8_t*)av_malloc(dstH * rgb48Stride);
+                                if (rgb48) {
+                                    uint8_t* d[1] = { rgb48 };
+                                    int      s[1] = { rgb48Stride };
+                                    sws_scale(hdr_sws, frame->data, frame->linesize,
+                                              0, srcH, d, s);
+
+                                    const double refW = isPQ ? 0.0203 : 0.25;
+                                    for (int y = 0; y < dstH; y++) {
+                                        const uint16_t* src16 =
+                                            (const uint16_t*)(rgb48 + y * rgb48Stride);
+                                        uint8_t* dst =
+                                            rgbFrame->data[0] + y * rgbFrame->linesize[0];
+                                        for (int x = 0; x < dstW; x++) {
+                                            double R = src16[x*3+0] / 65535.0;
+                                            double G = src16[x*3+1] / 65535.0;
+                                            double B = src16[x*3+2] / 65535.0;
+                                            if (isPQ) { R = pq_eotf(R); G = pq_eotf(G); B = pq_eotf(B); }
+                                            else       { R = hlg_eotf(R); G = hlg_eotf(G); B = hlg_eotf(B); }
+                                            double Ro = k_bt2020_to_bt709[0][0]*R + k_bt2020_to_bt709[0][1]*G + k_bt2020_to_bt709[0][2]*B;
+                                            double Go = k_bt2020_to_bt709[1][0]*R + k_bt2020_to_bt709[1][1]*G + k_bt2020_to_bt709[1][2]*B;
+                                            double Bo = k_bt2020_to_bt709[2][0]*R + k_bt2020_to_bt709[2][1]*G + k_bt2020_to_bt709[2][2]*B;
+                                            if (Ro < 0.0) Ro = 0.0; if (Go < 0.0) Go = 0.0; if (Bo < 0.0) Bo = 0.0;
+                                            Ro = reinhard_tm(Ro, refW); Go = reinhard_tm(Go, refW); Bo = reinhard_tm(Bo, refW);
+                                            dst[x*3+0] = srgb_pack(Bo);
+                                            dst[x*3+1] = srgb_pack(Go);
+                                            dst[x*3+2] = srgb_pack(Ro);
+                                        }
+                                    }
+                                    av_free(rgb48);
+                                    gotFrame = true;
+                                }
+                                sws_freeContext(hdr_sws);
+                            }
+                        } else {
+                            // --- SDR path ---
+                            sws_ctx = sws_getContext(
+                                srcW, srcH, srcFmt,
+                                dstW, dstH, AV_PIX_FMT_BGR24,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (sws_ctx) {
+                                sws_scale(sws_ctx, frame->data, frame->linesize, 0, srcH,
+                                    rgbFrame->data, rgbFrame->linesize);
+                                gotFrame = true;
+                            }
+                        }
+                    }
+                    av_frame_unref(frame); // always unref; processing already copied data
+                }
+            }
+            av_packet_unref(pkt);
+        }
+        if (!gotFrame) goto tf_cleanup;
+
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = dstW;
+        bmi.bmiHeader.biHeight      = -dstH;
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 24;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* dibBits = nullptr;
+        HDC hdc = GetDC(nullptr);
+        hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+        ReleaseDC(nullptr, hdc);
+        if (hBitmap && dibBits) {
+            // DIB rows are DWORD-aligned; srcFrame rows may not be.
+            // Using dstW*3 as the destination stride corrupts any video
+            // whose thumbnail width is not a multiple of 4 (e.g. 2.35:1 → dstW=211).
+            int srcRowBytes = dstW * 3;
+            int dibStride   = (srcRowBytes + 3) & ~3;  // round up to 4-byte boundary
+            for (int y = 0; y < dstH; y++)
+                memcpy((uint8_t*)dibBits + y * dibStride,
+                    rgbFrame->data[0] + y * rgbFrame->linesize[0], srcRowBytes);
+        }
+    }
+tf_cleanup:
+    if (sws_ctx)  sws_freeContext(sws_ctx);
+    if (frame)    av_frame_free(&frame);
+    if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
+    if (pkt)      av_packet_free(&pkt);
+    if (dec_ctx)  avcodec_free_context(&dec_ctx);
+    if (fmt_ctx)  avformat_close_input(&fmt_ctx);
+    return hBitmap;
+}
+
+static unsigned __stdcall ThumbExtractThreadProc(void* /*param*/) {
+    // Determine the timeline's pixel width so that each thumbnail is captured at
+    // the exact time corresponding to the centre of its display slot.
+    // Slot i spans [i*W/21, (i+1)*W/21]; its centre is at (i+0.5)*W/21 pixels,
+    // which maps to time (i+0.5)/21 * duration — matching the playhead formula.
+    int tlW = 0;
+    if (g_hTimeline) {
+        RECT tlrc; GetClientRect(g_hTimeline, &tlrc);
+        tlW = tlrc.right;
+    }
+    const int N = 21;
+    for (int i = 0; i < N && !g_thumbThreadStop; i++) {
+        // Centre of slot i in pixels → time
+        double centerPx = (i + 0.5) * (tlW > 0 ? tlW : 1000) / (double)N;
+        double t = centerPx / (tlW > 0 ? tlW : 1000) * g_duration;
+        // Simplifies to: t = (i + 0.5) / N * duration, independent of width.
+        // The width query is kept so the intent is explicit and survives resize logic.
+        HBITMAP bmp = ExtractFrameAtTime(g_inputPath, t);
+        if (!g_thumbThreadStop) {
+            g_thumbs[i] = bmp;
+            PostMessage(g_mainHwnd, WM_APP_THUMBS_READY, 0, 0);
+        } else {
+            if (bmp) DeleteObject(bmp);
+        }
+    }
+    return 0;
+}
+
+// ------------------------------ Timeline Window Proc ------------------------------
+LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int W = rc.right, H = rc.bottom;
+
+        // Dark base
+        HBRUSH bgBrush = CreateSolidBrush(RGB(18, 18, 22));
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        // Draw filmstrip thumbnails
+        if (g_thumbW > 0 && g_thumbH > 0 && W > 0) {
+            float slotW = (float)W / 21.0f;
+            for (int i = 0; i <= 20; i++) {
+                if (!g_thumbs[i]) continue;
+                int x0 = (int)(i * slotW);
+                int x1 = (int)((i + 1) * slotW);
+                int sw = max(1, x1 - x0);
+                HDC memDC = CreateCompatibleDC(hdc);
+                HBITMAP old = (HBITMAP)SelectObject(memDC, g_thumbs[i]);
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, nullptr);
+                StretchBlt(hdc, x0, 0, sw, H, memDC, 0, 0, g_thumbW, g_thumbH, SRCCOPY);
+                SelectObject(memDC, old);
+                DeleteDC(memDC);
+            }
+        }
+
+        // Thin separator lines between thumbnail slots
+        if (g_thumbW > 0 && W > 0) {
+            HPEN sepPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+            HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+            float slotW = (float)W / 21.0f;
+            for (int i = 1; i <= 20; i++) {
+                int x = (int)(i * slotW);
+                MoveToEx(hdc, x, 0, nullptr);
+                LineTo(hdc, x, H);
+            }
+            SelectObject(hdc, oldPen);
+            DeleteObject(sepPen);
+        }
+
+        // White playhead line
+        if (g_tlMax > 0 && W > 0) {
+            int px = (int)((double)g_tlPos / g_tlMax * W);
+            if (px < 0) px = 0; if (px >= W) px = W - 1;
+            HPEN headPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+            HPEN oldPen  = (HPEN)SelectObject(hdc, headPen);
+            MoveToEx(hdc, px, 0, nullptr);
+            LineTo(hdc, px, H);
+            SelectObject(hdc, oldPen);
+            DeleteObject(headPen);
+        }
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        if (!g_tlEnabled || !g_playerReady) break;
+        SetCapture(hwnd);
+        g_isDragging = true;
+        RECT rc; GetClientRect(hwnd, &rc);
+        int x = GET_X_LPARAM(lParam);
+        g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        g_tlPos = max(0, min(g_tlPos, g_tlMax));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    }
+
+    case WM_MOUSEMOVE: {
+        if (!g_isDragging) break;
+        RECT rc; GetClientRect(hwnd, &rc);
+        int x = GET_X_LPARAM(lParam);
+        g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        g_tlPos = max(0, min(g_tlPos, g_tlMax));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    }
+
+    case WM_LBUTTONUP: {
+        if (!g_isDragging) break;
+        ReleaseCapture();
+        g_isDragging = false;
+        RECT rc; GetClientRect(hwnd, &rc);
+        int x = GET_X_LPARAM(lParam);
+        g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        g_tlPos = max(0, min(g_tlPos, g_tlMax));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        // Seek to final position
+        if (g_playerReady) {
+            g_isGenerating = true;
+            EnsureThreadRunningPaused(g_mainHwnd);
+            SeekMs(g_tlPos, !g_isPlaying);
+            InvalidateRect(g_mainHwnd, nullptr, FALSE);
+        }
+        break;
+    }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
