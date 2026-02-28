@@ -1,0 +1,4 @@
+// Resizer.rc
+#include <windows.h>
+
+101 ICON "Resizer.ico"

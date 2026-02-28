@@ -8,6 +8,8 @@
 #include <shellapi.h>
 #include <strsafe.h>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <cmath>
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
@@ -27,8 +29,15 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
+#include <libavutil/dict.h>
 #include <libswscale/swscale.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 }
+
+// ------------------------------ Resource IDs ------------------------------
+#define IDI_APPICON                  101
 
 // ------------------------------ Control IDs ------------------------------
 #define IDC_INFO_STATIC           1001
@@ -63,6 +72,12 @@ extern "C" {
 #define IDC_GRP_RESOLUTION        2012
 #define IDC_GRP_PLAYER            2013
 #define IDC_RES_DROPDOWN          2014
+#define IDC_RES_STATIC            2015
+#define IDC_AUDIO_STATIC          2016
+#define IDC_AUDIO_DROPDOWN        2017
+#define IDC_SUBS_STATIC           2018
+#define IDC_SUBS_DROPDOWN         2019
+#define IDC_GRP_MEDIA             2020
 
 // ------------------------------ Globals ------------------------------
 #define WM_APP_FRAME_READY (WM_APP + 1)
@@ -112,6 +127,12 @@ static HFONT    g_hFont          = nullptr;
 static HFONT    g_hLabelFont     = nullptr;  // semibold variant for labels/radios
 static HWND     g_hResDrop       = nullptr;  // owner-draw resolution dropdown button
 static int      g_resSelection   = 0;        // 0=Full, 1=Half, 2=Quarter
+static HWND     g_hResStatic     = nullptr;  // "Resolution:" label
+static HWND     g_hGrpMedia      = nullptr;  // Audio & Subtitles group box
+static HWND     g_hAudioStatic   = nullptr;  // "Audio track:" label
+static HWND     g_hAudioDrop     = nullptr;  // audio track combo box
+static HWND     g_hSubsStatic    = nullptr;  // "Burn in Subtitles:" label
+static HWND     g_hSubsDrop      = nullptr;  // subtitles combo box
 static ULONG_PTR g_gdiplusToken  = 0;
 static HWND      g_hTooltip      = nullptr;
 
@@ -160,7 +181,11 @@ static unsigned __stdcall ThumbExtractThreadProc(void* param);
 bool GetVideoInfo(const char* filepath, int& width, int& height, double& durationSeconds);
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
-    int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds);
+    int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds,
+    int audio_stream_index = -1, int subtitle_stream_index = -1);
+
+// Audio/subtitle track enumeration
+static void PopulateAudioAndSubsDropdowns(const char* filepath);
 
 // Playback helpers
 unsigned __stdcall PlaybackThreadProc(void*);
@@ -188,8 +213,8 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     MoveWindow(g_hInfoStatic, M, y, clientW - M * 2, RH, TRUE);
     y += RH + M;
 
-    // === Output Settings ===
-    int settingsH = GH + P + RH + 5 + RH + P;
+    // === Output Settings (3 rows: Target MB, Suffix, Resolution) ===
+    int settingsH = GH + P + RH + 5 + RH + 5 + RH + P;
     MoveWindow(g_hGrpSettings, M, y, clientW - M * 2, settingsH, TRUE);
     {
         int ix = M + P, iy = y + GH;
@@ -200,42 +225,50 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         iy += RH + 5;
         MoveWindow(g_hSuffixStatic, ix,          iy, lw, RH, TRUE);
         MoveWindow(g_hSuffixEdit,   ix + lw + 6, iy, ew, RH, TRUE);
+        iy += RH + 5;
+        MoveWindow(g_hResStatic,    ix,          iy, lw, RH, TRUE);
+        MoveWindow(g_hResDrop,      ix + lw + 6, iy, ew, RH, TRUE);
     }
     y += settingsH + M;
 
-    // === Range (now includes resolution dropdown on the right) ===
+    // === Range (radios + start/end, full width) ===
     int rangeH = GH + P + RH + P;
     MoveWindow(g_hGrpRange, M, y, clientW - M * 2, rangeH, TRUE);
     {
-        int ix    = M + P, iy = y + GH;
+        int ix     = M + P, iy = y + GH;
         int innerW = clientW - M * 2 - P * 2;
         int rightIx = ix + innerW;
 
-        // Resolution dropdown fixed on the far right
-        const int dropW = 148;
-        MoveWindow(g_hResDrop, rightIx - dropW, iy, dropW, RH, TRUE);
-
-        // Range radios on the left
         const int radioW1 = 105, radioW2 = 120, gapR = 10;
-        MoveWindow(g_hRangeFullRadio,   ix,                   iy, radioW1, RH, TRUE);
-        MoveWindow(g_hRangeCustomRadio, ix + radioW1 + gapR,  iy, radioW2, RH, TRUE);
+        MoveWindow(g_hRangeFullRadio,   ix,                  iy, radioW1, RH, TRUE);
+        MoveWindow(g_hRangeCustomRadio, ix + radioW1 + gapR, iy, radioW2, RH, TRUE);
 
-        // Start / End fields in the middle, labels wide enough to not clip
         int midLeft  = ix + radioW1 + gapR + radioW2 + 12;
-        int midRight = rightIx - dropW - 10;
+        int midRight = rightIx;
         int midW     = midRight - midLeft;
         const int labelW = 90;
         int editW = max(40, (midW - labelW * 2 - 8) / 2);
-        MoveWindow(g_hStartStatic, midLeft,                             iy, labelW, RH, TRUE);
-        MoveWindow(g_hStartEdit,   midLeft + labelW,                    iy, editW,  RH, TRUE);
-        MoveWindow(g_hEndStatic,   midLeft + labelW + editW + 8,        iy, labelW, RH, TRUE);
-        MoveWindow(g_hEndEdit,     midLeft + labelW * 2 + editW + 8,    iy, editW,  RH, TRUE);
+        MoveWindow(g_hStartStatic, midLeft,                          iy, labelW, RH, TRUE);
+        MoveWindow(g_hStartEdit,   midLeft + labelW,                 iy, editW,  RH, TRUE);
+        MoveWindow(g_hEndStatic,   midLeft + labelW + editW + 8,     iy, labelW, RH, TRUE);
+        MoveWindow(g_hEndEdit,     midLeft + labelW * 2 + editW + 8, iy, editW,  RH, TRUE);
     }
     y += rangeH + M;
 
-    // === Start button ===
-    MoveWindow(g_hStartButton, M, y, clientW - M * 2, 32, TRUE);
-    y += 32 + M;
+    // === Audio & Subtitles (2 rows) ===
+    int mediaH = GH + P + RH + 5 + RH + P;
+    MoveWindow(g_hGrpMedia, M, y, clientW - M * 2, mediaH, TRUE);
+    {
+        int ix = M + P, iy = y + GH;
+        int lw = 130;
+        int ew = max(50, clientW - M * 2 - P * 2 - lw - 6);
+        MoveWindow(g_hAudioStatic, ix,          iy, lw,  RH,  TRUE);
+        MoveWindow(g_hAudioDrop,   ix + lw + 6, iy, ew,  120, TRUE);
+        iy += RH + 5;
+        MoveWindow(g_hSubsStatic,  ix,          iy, lw,  RH,  TRUE);
+        MoveWindow(g_hSubsDrop,    ix + lw + 6, iy, ew,  120, TRUE);
+    }
+    y += mediaH + M;
 
     // === Player ===
     const int btnW = 90, btnH = 28, seekH = 72;
@@ -252,8 +285,12 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         iy += btnH + 6;
         MoveWindow(g_hTimeline, ix, iy, avail, seekH, TRUE);
     }
-    // frame preview fills remaining client area below the player group
+    y += playerH + M;
 
+    // === Start Processing button — very bottom ===
+    MoveWindow(g_hStartButton, M, y, clientW - M * 2, 32, TRUE);
+
+    // frame preview fills remaining client area below the start button
     InvalidateRect(hwnd, nullptr, TRUE);
 }
 
@@ -277,11 +314,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     const wchar_t CLASS_NAME[] = L"FFmpegDragDropClass";
     WNDCLASS wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInstance;
     wc.lpszClassName = CLASS_NAME;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;  // WM_ERASEBKGND handled manually for theme support
+    wc.hIcon         = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
 
     if (!RegisterClass(&wc)) {
         MessageBox(nullptr, L"Failed to register window class.", L"Error", MB_ICONERROR);
@@ -378,12 +416,17 @@ static void ApplyTheme(HWND hwnd) {
         if (g_hGrpRange)      SetWindowTheme(g_hGrpRange,       ctrlTheme, nullptr);
         if (g_hGrpResolution) SetWindowTheme(g_hGrpResolution,  ctrlTheme, nullptr);
         if (g_hGrpPlayer)     SetWindowTheme(g_hGrpPlayer,      ctrlTheme, nullptr);
+        if (g_hGrpMedia)      SetWindowTheme(g_hGrpMedia,       ctrlTheme, nullptr);
 
         // Edit controls — border + scrollbar rendered dark
         if (g_hSizeEdit)   SetWindowTheme(g_hSizeEdit,   editTheme, nullptr);
         if (g_hSuffixEdit) SetWindowTheme(g_hSuffixEdit, editTheme, nullptr);
         if (g_hStartEdit)  SetWindowTheme(g_hStartEdit,  editTheme, nullptr);
         if (g_hEndEdit)    SetWindowTheme(g_hEndEdit,    editTheme, nullptr);
+
+        // Combo boxes
+        if (g_hAudioDrop) SetWindowTheme(g_hAudioDrop, editTheme, nullptr);
+        if (g_hSubsDrop)  SetWindowTheme(g_hSubsDrop,  editTheme, nullptr);
 
         // Radio buttons — dot, circle and text rendered in correct mode
         if (g_hRangeFullRadio)   SetWindowTheme(g_hRangeFullRadio,   ctrlTheme, nullptr);
@@ -606,8 +649,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_RANGE, GetModuleHandle(nullptr), nullptr);
         g_hGrpResolution = CreateWindowEx(0, L"BUTTON", L"Resolution",
-            WS_CHILD | BS_GROUPBOX,   // not WS_VISIBLE — replaced by dropdown in Range group
+            WS_CHILD | BS_GROUPBOX,   // not WS_VISIBLE — replaced by dropdown in Settings group
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_RESOLUTION, GetModuleHandle(nullptr), nullptr);
+        g_hGrpMedia = CreateWindowEx(0, L"BUTTON", L"Audio & Subtitles",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_MEDIA, GetModuleHandle(nullptr), nullptr);
         g_hGrpPlayer = CreateWindowEx(0, L"BUTTON", L"Player",
             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_PLAYER, GetModuleHandle(nullptr), nullptr);
@@ -666,6 +712,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
             0, 0, 0, 0, hwnd, (HMENU)IDC_RES_DROPDOWN, GetModuleHandle(nullptr), nullptr);
 
+        g_hResStatic = CreateWindowEx(0, L"STATIC", L"Resolution:",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_RES_STATIC, GetModuleHandle(nullptr), nullptr);
+
+        g_hAudioStatic = CreateWindowEx(0, L"STATIC", L"Audio track:",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_AUDIO_STATIC, GetModuleHandle(nullptr), nullptr);
+        g_hAudioDrop = CreateWindowEx(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 0, 120, hwnd, (HMENU)IDC_AUDIO_DROPDOWN, GetModuleHandle(nullptr), nullptr);
+
+        g_hSubsStatic = CreateWindowEx(0, L"STATIC", L"Burn in Subtitles:",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SUBS_STATIC, GetModuleHandle(nullptr), nullptr);
+        g_hSubsDrop = CreateWindowEx(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 0, 120, hwnd, (HMENU)IDC_SUBS_DROPDOWN, GetModuleHandle(nullptr), nullptr);
+
         g_hStartButton = CreateWindowEx(0, L"BUTTON", L"",
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
             10, 210, 150, 30, hwnd, (HMENU)IDC_START_BUTTON, GetModuleHandle(nullptr), nullptr);
@@ -697,14 +761,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             applyFont(g_hGrpSettings);    applyFont(g_hGrpRange);
             applyFont(g_hGrpResolution);  applyFont(g_hGrpPlayer);
+            applyFont(g_hGrpMedia);
             applyFont(g_hInfoStatic);
             applyLabelFont(g_hSizeStatic);     applyFont(g_hSizeEdit);
             applyLabelFont(g_hSuffixStatic);   applyFont(g_hSuffixEdit);
+            applyLabelFont(g_hResStatic);      applyFont(g_hResDrop);
             applyLabelFont(g_hRangeFullRadio); applyLabelFont(g_hRangeCustomRadio);
             applyLabelFont(g_hStartStatic);    applyFont(g_hStartEdit);
             applyLabelFont(g_hEndStatic);      applyFont(g_hEndEdit);
             applyFont(g_hFullRadio);      applyFont(g_hHalfRadio);   applyFont(g_hQuarterRadio);
-            applyFont(g_hResDrop);
+            applyLabelFont(g_hAudioStatic);    applyFont(g_hAudioDrop);
+            applyLabelFont(g_hSubsStatic);     applyFont(g_hSubsDrop);
             applyFont(g_hBtnPlayPause);   applyFont(g_hBtnBack);
             applyFont(g_hBtnFwd);         applyFont(g_hBtnMarkIn);   applyFont(g_hBtnMarkOut);
         }
@@ -728,6 +795,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         };
         addTip(g_hStartButton,  L"Transcode video to the target file size");
         addTip(g_hResDrop,      L"Output resolution — click to change");
+        addTip(g_hAudioDrop,    L"Select which audio track to include in the output");
+        addTip(g_hSubsDrop,     L"Select a subtitle track to burn into the video, or None to skip");
         addTip(g_hBtnPlayPause, L"Play / Pause  [Space]");
         addTip(g_hBtnBack,      L"Step back one frame  [\u2190]");
         addTip(g_hBtnFwd,       L"Step forward one frame  [\u2192]");
@@ -839,8 +908,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SendMessage(g_hHalfRadio, BM_SETCHECK, BST_UNCHECKED, 0);
                 SendMessage(g_hQuarterRadio, BM_SETCHECK, BST_UNCHECKED, 0);
                 g_resSelection = 0;
+                EnableWindow(g_hResStatic, TRUE);
                 EnableWindow(g_hResDrop, TRUE);
                 InvalidateRect(g_hResDrop, nullptr, TRUE);
+
+                EnableWindow(g_hAudioStatic, TRUE);
+                EnableWindow(g_hAudioDrop,   TRUE);
+                EnableWindow(g_hSubsStatic,  TRUE);
+                EnableWindow(g_hSubsDrop,    TRUE);
+                PopulateAudioAndSubsDropdowns(g_inputPath);
 
                 EnableWindow(g_hStartButton, TRUE);
 
@@ -1012,9 +1088,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 StringCchCopyA(outPath, MAX_PATH, candidate);
             }
 
+            // Read user-selected audio and subtitle stream indices
+            int selAudio = -1, selSubs = -1;
+            {
+                LRESULT a = SendMessage(g_hAudioDrop, CB_GETCURSEL, 0, 0);
+                if (a != CB_ERR) selAudio = (int)(INT_PTR)SendMessage(g_hAudioDrop, CB_GETITEMDATA, a, 0);
+                LRESULT s = SendMessage(g_hSubsDrop, CB_GETCURSEL, 0, 0);
+                if (s != CB_ERR) selSubs  = (int)(INT_PTR)SendMessage(g_hSubsDrop,  CB_GETITEMDATA, s, 0);
+            }
+
             EnableWindow(g_hStartButton, FALSE);
             bool ok = TranscodeWithSizeAndScale(g_inputPath, outPath, targetSizeMB, scaleFactor,
-                g_vidWidth, g_vidHeight, startSecs, endSecs);
+                g_vidWidth, g_vidHeight, startSecs, endSecs, selAudio, selSubs);
             if (ok) {
                 std::string msg = "Successfully created:\n"; msg += outPath;
                 MessageBoxA(hwnd, msg.c_str(), "Success", MB_ICONINFORMATION);
@@ -1065,11 +1150,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT clientRect; GetClientRect(hwnd, &clientRect);
 
             RECT sbRect;
-            GetWindowRect(g_hTimeline, &sbRect);
+            GetWindowRect(g_hStartButton, &sbRect);
             ScreenToClient(hwnd, (POINT*)&sbRect.left);
             ScreenToClient(hwnd, (POINT*)&sbRect.right);
             int margin = 10;
-            int topY = sbRect.bottom + 30;
+            int topY = sbRect.bottom + margin;
 
             int availW = clientRect.right - margin * 2;
             int availH = clientRect.bottom - topY - margin;
@@ -1129,6 +1214,81 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
+}
+
+// ------------------------------ Audio / Subtitle Track Enumeration ------------------------------
+static void PopulateAudioAndSubsDropdowns(const char* filepath) {
+    SendMessage(g_hAudioDrop, CB_RESETCONTENT, 0, 0);
+    SendMessage(g_hSubsDrop,  CB_RESETCONTENT, 0, 0);
+    // "None" is always the first subtitle option (item data = -1 means no subtitles)
+    {
+        LRESULT ni = SendMessage(g_hSubsDrop, CB_ADDSTRING, 0, (LPARAM)L"None");
+        SendMessage(g_hSubsDrop, CB_SETITEMDATA, ni, (LPARAM)(INT_PTR)-1);
+    }
+
+    AVFormatContext* fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        if (fmt_ctx) avformat_close_input(&fmt_ctx);
+        LRESULT ni = SendMessage(g_hAudioDrop, CB_ADDSTRING, 0, (LPARAM)L"Default");
+        SendMessage(g_hAudioDrop, CB_SETITEMDATA, ni, (LPARAM)(INT_PTR)-1);
+        SendMessage(g_hAudioDrop, CB_SETCURSEL, 0, 0);
+        SendMessage(g_hSubsDrop,  CB_SETCURSEL, 0, 0);
+        return;
+    }
+
+    int audioIdx = 0, subIdx = 0;
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+        AVStream* s = fmt_ctx->streams[i];
+
+        if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            ++audioIdx;
+            AVDictionaryEntry* lang  = av_dict_get(s->metadata, "language", nullptr, 0);
+            AVDictionaryEntry* title = av_dict_get(s->metadata, "title",    nullptr, 0);
+            const char* codec = avcodec_get_name(s->codecpar->codec_id);
+            char labelA[128];
+            if (title && lang)
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s (%s)", audioIdx, title->value, lang->value);
+            else if (title)
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s", audioIdx, title->value);
+            else if (lang)
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s [%s]", audioIdx, lang->value, codec);
+            else
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s", audioIdx, codec);
+            wchar_t labelW[128];
+            MultiByteToWideChar(CP_UTF8, 0, labelA, -1, labelW, 128);
+            LRESULT ni = SendMessage(g_hAudioDrop, CB_ADDSTRING, 0, (LPARAM)labelW);
+            SendMessage(g_hAudioDrop, CB_SETITEMDATA, ni, (LPARAM)(INT_PTR)i); // global stream index
+        }
+        else if (s->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            ++subIdx;
+            AVCodecID cid = s->codecpar->codec_id;
+            AVDictionaryEntry* lang  = av_dict_get(s->metadata, "language", nullptr, 0);
+            AVDictionaryEntry* title = av_dict_get(s->metadata, "title",    nullptr, 0);
+            const char* codec = avcodec_get_name(cid);
+            char labelA[128];
+            if (title && lang)
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s (%s)", subIdx, title->value, lang->value);
+            else if (title)
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s [%s]", subIdx, title->value, codec);
+            else if (lang)
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s [%s]", subIdx, lang->value, codec);
+            else
+                StringCchPrintfA(labelA, 128, "Track %d \xe2\x80\x94 %s", subIdx, codec);
+            wchar_t labelW[128];
+            MultiByteToWideChar(CP_UTF8, 0, labelA, -1, labelW, 128);
+            LRESULT ni = SendMessage(g_hSubsDrop, CB_ADDSTRING, 0, (LPARAM)labelW);
+            SendMessage(g_hSubsDrop, CB_SETITEMDATA, ni, (LPARAM)(INT_PTR)i); // global stream index
+        }
+    }
+    avformat_close_input(&fmt_ctx);
+
+    if (audioIdx == 0) {
+        LRESULT ni = SendMessage(g_hAudioDrop, CB_ADDSTRING, 0, (LPARAM)L"No audio tracks");
+        SendMessage(g_hAudioDrop, CB_SETITEMDATA, ni, (LPARAM)(INT_PTR)-1);
+    }
+    SendMessage(g_hAudioDrop, CB_SETCURSEL, 0, 0);
+    SendMessage(g_hSubsDrop,  CB_SETCURSEL, 0, 0);
 }
 
 // ------------------------------ Video Info ------------------------------
@@ -1650,50 +1810,78 @@ void SetMarkOutFromCurrent(HWND hwnd) {
 }
 
 // ------------------------------ Transcode (unchanged) ------------------------------
+
+// Bitmap subtitle types (PGS, VOBSUB) are pre-decoded to these structs and
+// alpha-blended directly onto YUV frames; text-based subs go through libavfilter/libass.
+struct PgsRect  { int x, y, w, h; std::vector<uint8_t> bgra; };
+struct PgsEvent { int64_t pts_ms;  std::vector<PgsRect> rects; }; // rects.empty() = clear screen
+
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
-    int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds) {
-    int64_t           target_bitrate;
-    AVFormatContext* in_fmt_ctx = nullptr;
-    AVFormatContext* out_fmt_ctx = nullptr;
-    AVCodecContext* dec_ctx = nullptr;
-    AVCodecContext* enc_ctx = nullptr;
-    AVStream* video_in_stream = nullptr;
-    AVStream* video_out_stream = nullptr;
-    AVStream* audio_in_stream = nullptr;
-    AVStream* audio_out_stream = nullptr;
-    const AVCodec* video_decoder = nullptr;
-    const AVCodec* video_encoder = nullptr;
-    SwsContext* sws_ctx = nullptr;
+    int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds,
+    int audio_stream_index, int subtitle_stream_index) {
+    int64_t           target_bitrate   = 0;
+    AVFormatContext*  in_fmt_ctx       = nullptr;
+    AVFormatContext*  out_fmt_ctx      = nullptr;
+    AVCodecContext*   dec_ctx          = nullptr;
+    AVCodecContext*   enc_ctx          = nullptr;
+    AVStream*         video_in_stream  = nullptr;
+    AVStream*         video_out_stream = nullptr;
+    AVStream*         audio_in_stream  = nullptr;
+    AVStream*         audio_out_stream = nullptr;
+    const AVCodec*    video_decoder    = nullptr;
+    const AVCodec*    video_encoder    = nullptr;
+    SwsContext*       sws_ctx          = nullptr;
+    AVFilterGraph*    filter_graph     = nullptr;
+    AVFilterContext*  buffersrc_ctx    = nullptr;
+    AVFilterContext*  buffersink_ctx   = nullptr;
+    bool              use_filter       = false;
+    bool              use_bitmap_subs  = false;
+    std::vector<PgsEvent> pgs_events;
     int               videoStreamIndex = -1;
     int               audioStreamIndex = -1;
-    AVFrame* frame = nullptr;
-    AVFrame* filt_frame = nullptr;
-    AVPacket* pkt = nullptr;
-    AVPacket* enc_pkt = nullptr;
-    bool              success = false;
-    int64_t           video_start_pts = 0;
-    int64_t           audio_start_pts = 0;
+    AVFrame*          frame            = nullptr;
+    AVFrame*          filt_frame       = nullptr;
+    AVPacket*         pkt              = nullptr;
+    AVPacket*         enc_pkt          = nullptr;
+    bool              success          = false;
+    int64_t           video_start_pts  = 0;
+    int64_t           audio_start_pts  = 0;
 
     if (end_seconds <= start_seconds) { OutputDebugStringA("End time must be greater than start time.\n"); return false; }
     double segment_duration = end_seconds - start_seconds;
     if (segment_duration <= 0.0) { OutputDebugStringA("Invalid segment duration.\n"); return false; }
-    {
-        int64_t total_bits = (int64_t)(target_size_mb * 8.0 * 1024.0 * 1024.0);
-        int64_t video_bits = (int64_t)(total_bits * 0.95);
-        target_bitrate = (int64_t)(video_bits / segment_duration);
-    }
-    if (target_bitrate <= 0) { OutputDebugStringA("Invalid target bitrate calculated.\n"); return false; }
 
     if (avformat_open_input(&in_fmt_ctx, in_filename, nullptr, nullptr) < 0) { OutputDebugStringA("Could not open input file.\n"); goto cleanup; }
     if (avformat_find_stream_info(in_fmt_ctx, nullptr) < 0) { OutputDebugStringA("Could not find stream info.\n"); goto cleanup; }
     for (unsigned int i = 0; i < in_fmt_ctx->nb_streams; i++) {
         AVStream* st = in_fmt_ctx->streams[i];
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex < 0) { videoStreamIndex = i; }
-        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex < 0) { audioStreamIndex = i; }
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex < 0) { videoStreamIndex = (int)i; }
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex < 0) { audioStreamIndex = (int)i; }
     }
+    // Use user-selected audio stream if valid
+    if (audio_stream_index >= 0 && (unsigned int)audio_stream_index < in_fmt_ctx->nb_streams &&
+        in_fmt_ctx->streams[audio_stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        audioStreamIndex = audio_stream_index;
+
     if (videoStreamIndex < 0) { OutputDebugStringA("No video stream found.\n"); goto cleanup; }
     video_in_stream = in_fmt_ctx->streams[videoStreamIndex];
     if (audioStreamIndex >= 0) audio_in_stream = in_fmt_ctx->streams[audioStreamIndex];
+
+    // Bitrate calculation: subtract the actual audio stream bitrate so video uses the remaining budget
+    {
+        int64_t total_bits    = (int64_t)(target_size_mb * 8.0 * 1024.0 * 1024.0);
+        int64_t audio_bitrate = 0;
+        if (audio_in_stream) {
+            audio_bitrate = audio_in_stream->codecpar->bit_rate;
+            if (audio_bitrate <= 0) audio_bitrate = 192000; // safe fallback if container doesn't report it
+        }
+        int64_t audio_bits  = (int64_t)(audio_bitrate * segment_duration);
+        int64_t overhead    = (int64_t)(total_bits * 0.01); // ~1% for container overhead
+        int64_t video_bits  = total_bits - audio_bits - overhead;
+        if (video_bits <= 0) video_bits = total_bits / 2;  // audio alone exceeds budget; give video 50%
+        target_bitrate = (int64_t)(video_bits / segment_duration);
+    }
+    if (target_bitrate <= 0) { OutputDebugStringA("Invalid target bitrate calculated.\n"); goto cleanup; }
 
     video_decoder = avcodec_find_decoder(video_in_stream->codecpar->codec_id);
     if (!video_decoder) { OutputDebugStringA("Video decoder not found.\n"); goto cleanup; }
@@ -1717,7 +1905,15 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
     if (strcmp(video_encoder->name, "h264_nvenc") == 0) enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
     else { enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P; av_opt_set(enc_ctx->priv_data, "preset", "medium", 0); av_opt_set(enc_ctx->priv_data, "nal-hrd", "cbr", 0); }
-    enc_ctx->time_base = av_inv_q(dec_ctx->framerate);
+    {
+        // Prefer codec framerate, fall back to stream's avg_frame_rate, then 30 fps
+        AVRational fps = dec_ctx->framerate;
+        if (fps.num <= 0 || fps.den <= 0) fps = video_in_stream->avg_frame_rate;
+        if (fps.num <= 0 || fps.den <= 0) fps = { 30, 1 };
+        enc_ctx->time_base    = av_inv_q(fps);
+        enc_ctx->max_b_frames = 0;  // no B-frames → DTS always == PTS → clean seeking
+        enc_ctx->gop_size     = max(1, (int)(av_q2d(fps) * 2.0)); // keyframe every ~2 s
+    }
     enc_ctx->bit_rate = target_bitrate;
     enc_ctx->rc_max_rate = target_bitrate;
     enc_ctx->rc_buffer_size = target_bitrate;
@@ -1738,7 +1934,13 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&out_fmt_ctx->pb, out_filename, AVIO_FLAG_WRITE) < 0) { OutputDebugStringA("Could not open output file.\n"); goto cleanup; }
     }
-    if (avformat_write_header(out_fmt_ctx, nullptr) < 0) { OutputDebugStringA("Error writing header to output.\n"); goto cleanup; }
+    {
+        AVDictionary* mux_opts = nullptr;
+        av_dict_set(&mux_opts, "movflags", "faststart", 0); // moov atom at front → instant seeking
+        int wh = avformat_write_header(out_fmt_ctx, &mux_opts);
+        av_dict_free(&mux_opts);
+        if (wh < 0) { OutputDebugStringA("Error writing header to output.\n"); goto cleanup; }
+    }
 
     {
         AVRational video_tb = video_in_stream->time_base;
@@ -1774,6 +1976,154 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     filt_frame->height = enc_ctx->height;
     if (av_frame_get_buffer(filt_frame, 32) < 0) { OutputDebugStringA("Could not allocate buffer for scaled frame.\n"); goto cleanup; }
 
+    // Pre-load bitmap subtitle events (PGS/VOBSUB) using a separate format context.
+    // Text-based subtitles fall through to the libavfilter/libass path below.
+    if (subtitle_stream_index >= 0 &&
+        (unsigned)subtitle_stream_index < in_fmt_ctx->nb_streams) {
+        AVCodecID cid = in_fmt_ctx->streams[subtitle_stream_index]->codecpar->codec_id;
+        bool is_bitmap = (cid == AV_CODEC_ID_HDMV_PGS_SUBTITLE ||
+                          cid == AV_CODEC_ID_DVD_SUBTITLE ||
+                          cid == AV_CODEC_ID_XSUB);
+        if (is_bitmap) {
+            const AVCodec* sub_codec = avcodec_find_decoder(cid);
+            AVCodecContext* sub_dec = sub_codec ? avcodec_alloc_context3(sub_codec) : nullptr;
+            if (sub_dec) {
+                avcodec_parameters_to_context(sub_dec, in_fmt_ctx->streams[subtitle_stream_index]->codecpar);
+                if (avcodec_open2(sub_dec, sub_codec, nullptr) >= 0) {
+                    AVFormatContext* sub_fmt = nullptr;
+                    if (avformat_open_input(&sub_fmt, in_filename, nullptr, nullptr) >= 0 &&
+                        avformat_find_stream_info(sub_fmt, nullptr) >= 0) {
+                        AVPacket* sub_pkt = av_packet_alloc();
+                        while (sub_pkt && av_read_frame(sub_fmt, sub_pkt) >= 0) {
+                            if (sub_pkt->stream_index == subtitle_stream_index) {
+                                AVSubtitle sub = {};
+                                int got_sub = 0;
+                                avcodec_decode_subtitle2(sub_dec, &sub, &got_sub, sub_pkt);
+                                if (got_sub) {
+                                    // AVSubtitle.pts is in microseconds (AV_TIME_BASE)
+                                    int64_t s_ms = (sub.pts != AV_NOPTS_VALUE)
+                                        ? sub.pts / 1000
+                                        : (int64_t)(sub_pkt->pts * av_q2d(in_fmt_ctx->streams[subtitle_stream_index]->time_base) * 1000.0);
+                                    PgsEvent ev;
+                                    ev.pts_ms = s_ms;
+                                    for (unsigned ri = 0; ri < sub.num_rects; ri++) {
+                                        AVSubtitleRect* rect = sub.rects[ri];
+                                        if (rect->type == SUBTITLE_BITMAP && rect->w > 0 && rect->h > 0) {
+                                            PgsRect pr;
+                                            pr.x = rect->x; pr.y = rect->y;
+                                            pr.w = rect->w; pr.h = rect->h;
+                                            pr.bgra.resize((size_t)pr.w * pr.h * 4);
+                                            uint8_t* pal = rect->data[1]; // BGRA palette (256 × 4 bytes)
+                                            for (int py = 0; py < pr.h; py++) {
+                                                for (int px = 0; px < pr.w; px++) {
+                                                    uint8_t idx = rect->data[0][py * rect->linesize[0] + px];
+                                                    uint8_t* dst = pr.bgra.data() + ((size_t)py * pr.w + px) * 4;
+                                                    dst[0] = pal[idx * 4 + 0]; // B
+                                                    dst[1] = pal[idx * 4 + 1]; // G
+                                                    dst[2] = pal[idx * 4 + 2]; // R
+                                                    dst[3] = pal[idx * 4 + 3]; // A
+                                                }
+                                            }
+                                            ev.rects.push_back(std::move(pr));
+                                        }
+                                    }
+                                    pgs_events.push_back(std::move(ev));
+                                    avsubtitle_free(&sub);
+                                }
+                            }
+                            av_packet_unref(sub_pkt);
+                        }
+                        av_packet_free(&sub_pkt);
+                        avformat_close_input(&sub_fmt);
+                        std::sort(pgs_events.begin(), pgs_events.end(),
+                            [](const PgsEvent& a, const PgsEvent& b){ return a.pts_ms < b.pts_ms; });
+                        use_bitmap_subs = !pgs_events.empty();
+                    }
+                }
+                avcodec_free_context(&sub_dec);
+            }
+        }
+    }
+
+    // Set up subtitle burn-in filter graph if a subtitle stream was selected
+    // (text-based subtitles only — bitmap types handled by use_bitmap_subs above)
+    if (subtitle_stream_index >= 0 && !use_bitmap_subs) {
+        const AVFilter* buffersrc  = avfilter_get_by_name("buffer");
+        const AVFilter* buffersink = avfilter_get_by_name("buffersink");
+        if (buffersrc && buffersink) {
+            filter_graph = avfilter_graph_alloc();
+            if (filter_graph) {
+                // Describe the input video stream for the buffer source
+                char src_args[256];
+                AVRational tb  = video_in_stream->time_base;
+                AVRational sar = dec_ctx->sample_aspect_ratio;
+                snprintf(src_args, sizeof(src_args),
+                    "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                    dec_ctx->width, dec_ctx->height, (int)dec_ctx->pix_fmt,
+                    tb.num, tb.den, sar.num ? sar.num : 1, sar.den ? sar.den : 1);
+
+                int ret = avfilter_graph_create_filter(&buffersrc_ctx,  buffersrc,  "in",  src_args, nullptr, filter_graph);
+                if (ret >= 0)
+                    ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", nullptr,  nullptr, filter_graph);
+
+                if (ret >= 0) {
+                    // Build the subtitles filter string.
+                    // Path is wrapped in single quotes so colons don't need escaping;
+                    // just convert backslashes to forward slashes (both work on Windows).
+                    char esc[MAX_PATH * 2]; int k = 0;
+                    for (int j = 0; in_filename[j] && k < (int)sizeof(esc) - 2; j++) {
+                        char c = in_filename[j];
+                        esc[k++] = (c == '\\') ? '/' : c;
+                    }
+                    esc[k] = '\0';
+                    // The subtitles filter si= takes 0-based index among subtitle streams,
+                    // not the global stream index stored in the combo box item data.
+                    int subtitle_si = 0;
+                    for (unsigned int j = 0; j < in_fmt_ctx->nb_streams && (int)j < subtitle_stream_index; j++)
+                        if (in_fmt_ctx->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                            subtitle_si++;
+
+                    // Get Windows Fonts dir so libass can initialize its font engine
+                    char windir[MAX_PATH] = {};
+                    GetWindowsDirectoryA(windir, MAX_PATH);
+                    char fontspath[MAX_PATH + 8];
+                    snprintf(fontspath, sizeof(fontspath), "%s/Fonts", windir);
+                    for (int j = 0; fontspath[j]; j++)
+                        if (fontspath[j] == '\\') fontspath[j] = '/';
+
+                    char filter_descr[MAX_PATH * 2 + 512];
+                    snprintf(filter_descr, sizeof(filter_descr),
+                        "subtitles='%s':si=%d:fontsdir='%s'",
+                        esc, subtitle_si, fontspath);
+
+                    AVFilterInOut* outputs = avfilter_inout_alloc();
+                    AVFilterInOut* inputs  = avfilter_inout_alloc();
+                    if (outputs && inputs) {
+                        outputs->name = av_strdup("in");  outputs->filter_ctx = buffersrc_ctx;  outputs->pad_idx = 0; outputs->next = nullptr;
+                        inputs->name  = av_strdup("out"); inputs->filter_ctx  = buffersink_ctx; inputs->pad_idx  = 0; inputs->next  = nullptr;
+                        ret = avfilter_graph_parse_ptr(filter_graph, filter_descr, &inputs, &outputs, nullptr);
+                        if (ret >= 0) ret = avfilter_graph_config(filter_graph, nullptr);
+                    }
+                    avfilter_inout_free(&outputs);
+                    avfilter_inout_free(&inputs);
+                    if (ret >= 0) {
+                        use_filter = true;
+                    } else {
+                        char errbuf[256]; av_strerror(ret, errbuf, sizeof(errbuf));
+                        char msg[MAX_PATH * 2 + 512];
+                        snprintf(msg, sizeof(msg),
+                            "Subtitle filter setup failed.\n\nError: %s\n\nFilter string:\n%s",
+                            errbuf, filter_descr);
+                        MessageBoxA(nullptr, msg, "Subtitle Error", MB_OK | MB_ICONWARNING);
+                        avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                    }
+                } else {
+                    avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                }
+            }
+        }
+    }
+
     while (av_read_frame(in_fmt_ctx, pkt) >= 0) {
         if (pkt->stream_index == videoStreamIndex) {
             if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
@@ -1791,7 +2141,75 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 if (rel_vid_pts < 0) rel_vid_pts = 0;
                 filt_frame->pts = av_rescale_q(rel_vid_pts, video_in_stream->time_base, enc_ctx->time_base);
 
-                sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height, filt_frame->data, filt_frame->linesize);
+                // Route through subtitle filter graph if active, otherwise scale directly
+                AVFrame* src_frame = frame;
+                AVFrame* filter_out = nullptr;
+                if (use_filter) {
+                    frame->pts = in_pts; // filter needs original pts for subtitle timing
+                    if (av_buffersrc_add_frame_flags(buffersrc_ctx, frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+                        filter_out = av_frame_alloc();
+                        int fret = filter_out ? av_buffersink_get_frame(buffersink_ctx, filter_out) : AVERROR(ENOMEM);
+                        // EAGAIN means the filter needs more frames — not an error, just use original
+                        if (fret < 0) { av_frame_free(&filter_out); filter_out = nullptr; }
+                        else { src_frame = filter_out; }
+                    }
+                }
+                sws_scale(sws_ctx, src_frame->data, src_frame->linesize, 0, src_frame->height, filt_frame->data, filt_frame->linesize);
+                if (filter_out) av_frame_free(&filter_out);
+
+                // Alpha-blend PGS bitmap subtitle onto the scaled YUV output frame
+                if (use_bitmap_subs) {
+                    int64_t cur_ms = (int64_t)(in_time * 1000.0);
+                    // Binary-search for the last event at or before cur_ms
+                    const PgsEvent* active = nullptr;
+                    for (const auto& ev : pgs_events) {
+                        if (ev.pts_ms <= cur_ms) active = &ev;
+                        else break;
+                    }
+                    if (active && !active->rects.empty()) {
+                        double sx = (double)enc_ctx->width  / dec_ctx->width;
+                        double sy = (double)enc_ctx->height / dec_ctx->height;
+                        for (const auto& rect : active->rects) {
+                            for (int py = 0; py < rect.h; py++) {
+                                for (int px = 0; px < rect.w; px++) {
+                                    const uint8_t* bgra = rect.bgra.data() + ((size_t)py * rect.w + px) * 4;
+                                    uint8_t a = bgra[3];
+                                    if (a == 0) continue;
+                                    int fx = (int)((rect.x + px) * sx);
+                                    int fy = (int)((rect.y + py) * sy);
+                                    if (fx < 0 || fy < 0 || fx >= enc_ctx->width || fy >= enc_ctx->height) continue;
+                                    uint8_t r = bgra[2], g = bgra[1], b = bgra[0];
+                                    int inv_a = 255 - a;
+                                    // BT.601 studio-swing RGB → YCbCr
+                                    int Y  = (( 66*r + 129*g +  25*b + 128) >> 8) + 16;
+                                    int Cb = ((-38*r -  74*g + 112*b + 128) >> 8) + 128;
+                                    int Cr = ((112*r -  94*g -  18*b + 128) >> 8) + 128;
+                                    Y  = max(16, min(235, Y));
+                                    Cb = max(16, min(240, Cb));
+                                    Cr = max(16, min(240, Cr));
+                                    // Blend luma
+                                    uint8_t* Yp = filt_frame->data[0] + fy * filt_frame->linesize[0] + fx;
+                                    *Yp = (uint8_t)((Y * a + *Yp * inv_a) >> 8);
+                                    // Blend chroma at 4:2:0 sub-sample positions
+                                    if ((fx & 1) == 0 && (fy & 1) == 0) {
+                                        int cy = fy >> 1, cx = fx >> 1;
+                                        if (enc_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+                                            uint8_t* Up = filt_frame->data[1] + cy * filt_frame->linesize[1] + cx;
+                                            uint8_t* Vp = filt_frame->data[2] + cy * filt_frame->linesize[2] + cx;
+                                            *Up = (uint8_t)((Cb * a + *Up * inv_a) >> 8);
+                                            *Vp = (uint8_t)((Cr * a + *Vp * inv_a) >> 8);
+                                        } else if (enc_ctx->pix_fmt == AV_PIX_FMT_NV12) {
+                                            uint8_t* UVp = filt_frame->data[1] + cy * filt_frame->linesize[1] + cx * 2;
+                                            *UVp       = (uint8_t)((Cb * a + *UVp       * inv_a) >> 8);
+                                            *(UVp + 1) = (uint8_t)((Cr * a + *(UVp + 1) * inv_a) >> 8);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (avcodec_send_frame(enc_ctx, filt_frame) < 0) { OutputDebugStringA("Error sending frame to video encoder.\n"); break; }
                 while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
                     enc_pkt->stream_index = video_out_stream->index;
@@ -1842,6 +2260,7 @@ flush_encoder:
     success = true;
 
 cleanup:
+    if (filter_graph) avfilter_graph_free(&filter_graph);
     if (sws_ctx) sws_freeContext(sws_ctx);
     if (frame) av_frame_free(&frame);
     if (filt_frame) av_frame_free(&filt_frame);
