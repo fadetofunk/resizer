@@ -181,6 +181,7 @@ static volatile float  g_encodeProgress = 0.0f;  // 0.0..1.0
 static volatile bool   g_encodeRunning  = false;
 static HANDLE          g_encodeThread   = nullptr;
 static char            g_encodeOutPath[MAX_PATH] = {};
+static int             g_videoTop       = 0;   // client-y where video preview starts (below start button)
 
 // ------------------------------ Theme ------------------------------
 struct AppTheme {
@@ -428,6 +429,7 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
 
     // === Start Processing button — very bottom ===
     MoveWindow(g_hStartButton, M, y, totalW, 32, TRUE);
+    g_videoTop = y + 32 + M;  // video preview starts below the start button
 
     // frame preview fills remaining client area below the start button
     InvalidateRect(hwnd, nullptr, TRUE);
@@ -1548,14 +1550,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_APP_FRAME_READY: {
         g_isGenerating = false;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (g_videoTop > 0) {
+            RECT rc; GetClientRect(hwnd, &rc);
+            rc.top = g_videoTop;
+            InvalidateRect(hwnd, &rc, FALSE);
+        } else {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         break;
     }
 
     case WM_TIMER: {
         if (wParam == IDT_UI_REFRESH) {
             UpdateSeekbarFromPos();
-            if (g_isPlaying) InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_isPlaying && g_videoTop > 0) {
+                RECT rc; GetClientRect(hwnd, &rc);
+                rc.top = g_videoTop;
+                InvalidateRect(hwnd, &rc, FALSE);
+            }
         }
         if (wParam == IDT_ENCODE_PROGRESS) {
             // Repaint the button to update the progress fill
@@ -3646,9 +3658,16 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RECT rc; GetClientRect(hwnd, &rc);
         int W = rc.right, H = rc.bottom;
 
+        // Off-screen double buffer: all drawing goes to memDC; a single BitBlt
+        // at the end copies the finished image to the screen with no visible
+        // intermediate state, eliminating the dark-flash between frames.
+        HDC     memDC  = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, W, H);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+
         // Dark base
         HBRUSH bgBrush = CreateSolidBrush(RGB(18, 18, 22));
-        FillRect(hdc, &rc, bgBrush);
+        FillRect(memDC, &rc, bgBrush);
         DeleteObject(bgBrush);
 
         // Draw filmstrip thumbnails
@@ -3659,27 +3678,27 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 int x0 = (int)(i * slotW);
                 int x1 = (int)((i + 1) * slotW);
                 int sw = max(1, x1 - x0);
-                HDC memDC = CreateCompatibleDC(hdc);
-                HBITMAP old = (HBITMAP)SelectObject(memDC, g_thumbs[i]);
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, nullptr);
-                StretchBlt(hdc, x0, 0, sw, H, memDC, 0, 0, g_thumbW, g_thumbH, SRCCOPY);
-                SelectObject(memDC, old);
-                DeleteDC(memDC);
+                HDC srcDC = CreateCompatibleDC(memDC);
+                HBITMAP old = (HBITMAP)SelectObject(srcDC, g_thumbs[i]);
+                SetStretchBltMode(memDC, HALFTONE);
+                SetBrushOrgEx(memDC, 0, 0, nullptr);
+                StretchBlt(memDC, x0, 0, sw, H, srcDC, 0, 0, g_thumbW, g_thumbH, SRCCOPY);
+                SelectObject(srcDC, old);
+                DeleteDC(srcDC);
             }
         }
 
         // Thin separator lines between thumbnail slots
         if (g_thumbW > 0 && W > 0) {
             HPEN sepPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
-            HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+            HPEN oldPen = (HPEN)SelectObject(memDC, sepPen);
             float slotW = (float)W / 21.0f;
             for (int i = 1; i <= 20; i++) {
                 int x = (int)(i * slotW);
-                MoveToEx(hdc, x, 0, nullptr);
-                LineTo(hdc, x, H);
+                MoveToEx(memDC, x, 0, nullptr);
+                LineTo(memDC, x, H);
             }
-            SelectObject(hdc, oldPen);
+            SelectObject(memDC, oldPen);
             DeleteObject(sepPen);
         }
 
@@ -3688,12 +3707,18 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             int px = (int)((double)g_tlPos / g_tlMax * W);
             if (px < 0) px = 0; if (px >= W) px = W - 1;
             HPEN headPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-            HPEN oldPen  = (HPEN)SelectObject(hdc, headPen);
-            MoveToEx(hdc, px, 0, nullptr);
-            LineTo(hdc, px, H);
-            SelectObject(hdc, oldPen);
+            HPEN oldPen  = (HPEN)SelectObject(memDC, headPen);
+            MoveToEx(memDC, px, 0, nullptr);
+            LineTo(memDC, px, H);
+            SelectObject(memDC, oldPen);
             DeleteObject(headPen);
         }
+
+        // Atomic blit to screen
+        BitBlt(hdc, 0, 0, W, H, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
 
         EndPaint(hwnd, &ps);
         return 0;
