@@ -70,8 +70,10 @@ extern "C" {
 #define IDC_BTN_MARKOUT           2006
 
 #define IDT_UI_REFRESH            3001
+#define IDT_ENCODE_PROGRESS       3002
 
 #define WM_APP_THUMBS_READY  (WM_APP + 3)
+#define WM_APP_ENCODE_DONE   (WM_APP + 4)
 
 #define IDC_GRP_SETTINGS          2010
 #define IDC_GRP_RANGE             2011
@@ -169,6 +171,12 @@ static bool     g_hdrLutValid      = false;
 // Hardware acceleration (NVDEC/NVENC)
 static AVBufferRef* g_hwDeviceCtx   = nullptr;  // CUDA device; null = no NVDEC available
 static bool         g_nvdecAvailable = false;
+
+// Encode progress (background thread)
+static volatile float  g_encodeProgress = 0.0f;  // 0.0..1.0
+static volatile bool   g_encodeRunning  = false;
+static HANDLE          g_encodeThread   = nullptr;
+static char            g_encodeOutPath[MAX_PATH] = {};
 
 // ------------------------------ Theme ------------------------------
 struct AppTheme {
@@ -274,6 +282,35 @@ static const AVCodec* find_best_decoder(AVCodecID id, bool& using_hw) {
         }
     }
     return avcodec_find_decoder(id);
+}
+
+// ------------------------------ Encode Thread ------------------------------
+struct EncodeArgs {
+    char   inPath[MAX_PATH];
+    char   outPath[MAX_PATH];
+    double targetSizeMB;
+    int    scaleFactor;
+    int    origW, origH;
+    double startSecs, endSecs;
+    int    selAudio, selSubs;
+    bool   convertHdrToSdr;
+    HWND   hwnd;
+};
+
+static unsigned __stdcall EncodeThreadProc(void* param) {
+    EncodeArgs* args = (EncodeArgs*)param;
+    g_encodeProgress = 0.0f;
+    StringCchCopyA(g_encodeOutPath, MAX_PATH, args->outPath);
+    bool ok = TranscodeWithSizeAndScale(
+        args->inPath, args->outPath, args->targetSizeMB,
+        args->scaleFactor, args->origW, args->origH,
+        args->startSecs, args->endSecs,
+        args->selAudio, args->selSubs, args->convertHdrToSdr);
+    g_encodeProgress = ok ? 1.0f : 0.0f;
+    g_encodeRunning  = false;
+    PostMessage(args->hwnd, WM_APP_ENCODE_DONE, ok ? 1 : 0, 0);
+    delete args;
+    return 0;
 }
 
 // ------------------------------ UI Layout ------------------------------
@@ -557,50 +594,107 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
 
     UINT id = GetDlgCtrlID(dis->hwndItem);
 
-    // Erase the full rect first (clears corners outside any shape)
-    FillRect(dis->hDC, &dis->rcItem, g_hBkBrush ? g_hBkBrush : GetSysColorBrush(COLOR_WINDOW));
+    // Off-screen double buffer: all drawing goes to memDC; a single BitBlt
+    // at the end copies the finished image to the screen with no visible
+    // intermediate state, eliminating the erase→redraw flicker.
+    HDC     memDC  = CreateCompatibleDC(dis->hDC);
+    HBITMAP memBmp = CreateCompatibleBitmap(dis->hDC, W, H);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-    Gdiplus::Graphics g(dis->hDC);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    // Erase background on the off-screen surface (corners outside pill shapes)
+    RECT rc = { 0, 0, W, H };
+    FillRect(memDC, &rc, g_hBkBrush ? g_hBkBrush : GetSysColorBrush(COLOR_WINDOW));
 
-    float bx = 1.0f, by = 1.0f;
-    float bw = (float)W - 2.0f, bh = (float)H - 2.0f;
+    {   // Scope so Graphics is destroyed (flushing to memDC) before the blit
+        Gdiplus::Graphics g(memDC);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
-    // ---- Start Processing button — teal gradient with text ----
+        float bx = 1.0f, by = 1.0f;
+        float bw = (float)W - 2.0f, bh = (float)H - 2.0f;
+
+    // ---- Start Processing button — teal idle / red+green progress ----
     if (id == IDC_START_BUTTON) {
         float r = 8.0f;
         Gdiplus::GraphicsPath path;
-        path.AddArc(bx,          by, r*2.0f, bh, 90.0f, 180.0f);
+        path.AddArc(bx,           by, r*2.0f, bh, 90.0f, 180.0f);
         path.AddArc(bx+bw-r*2.0f, by, r*2.0f, bh, 270.0f, 180.0f);
         path.CloseFigure();
 
-        Gdiplus::Color c1, c2;
-        if      (disabled) { c1 = Gdiplus::Color(255, 34, 50, 48); c2 = Gdiplus::Color(255, 26, 38, 36); }
-        else if (pressed)  { c1 = Gdiplus::Color(255, 16, 108, 98); c2 = Gdiplus::Color(255, 12, 84, 76); }
-        else               { c1 = Gdiplus::Color(255, 28, 152, 138); c2 = Gdiplus::Color(255, 20, 118, 106); }
+        float prog = g_encodeProgress;  // 0.0..1.0
+        bool inProgress = g_encodeRunning || (prog > 0.0f && prog < 1.0f);
+        bool done       = (!g_encodeRunning && prog >= 1.0f);
 
-        Gdiplus::LinearGradientBrush lgb(
-            Gdiplus::PointF(0.0f, by), Gdiplus::PointF(0.0f, by + bh), c1, c2);
-        g.FillPath(&lgb, &path);
-        if (!disabled) {
-            Gdiplus::Pen pen(Gdiplus::Color(90, 100, 255, 220), 1.0f);
+        if (inProgress || done) {
+            // Red background pill
+            Gdiplus::Color bgTop(255, 130, 20, 20);
+            Gdiplus::Color bgBot(255, 100, 14, 14);
+            Gdiplus::LinearGradientBrush bgBrush(
+                Gdiplus::PointF(0.0f, by), Gdiplus::PointF(0.0f, by + bh), bgTop, bgBot);
+            g.FillPath(&bgBrush, &path);
+
+            // Green fill — clip to left portion of the pill
+            float fillW = bw * prog;
+            if (fillW > 0.5f) {
+                Gdiplus::Region oldClip;
+                g.GetClip(&oldClip);
+                Gdiplus::RectF fillRect(bx, by, fillW, bh);
+                g.SetClip(fillRect);
+                Gdiplus::Color gTop(255, 30, 160, 55);
+                Gdiplus::Color gBot(255, 20, 125, 42);
+                Gdiplus::LinearGradientBrush greenBrush(
+                    Gdiplus::PointF(0.0f, by), Gdiplus::PointF(0.0f, by + bh), gTop, gBot);
+                g.FillPath(&greenBrush, &path);
+                g.SetClip(&oldClip);
+            }
+
+            // Subtle border
+            Gdiplus::Pen pen(Gdiplus::Color(70, 255, 80, 80), 1.0f);
             g.DrawPath(&pen, &path);
-        }
 
-        BYTE ta = disabled ? 85 : 235;
-        Gdiplus::SolidBrush tb(Gdiplus::Color(ta, 220, 255, 248));
-        HFONT hf = g_hFont ? g_hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        Gdiplus::Font font(dis->hDC, hf);
-        Gdiplus::RectF tr(bx, by, bw, bh);
-        Gdiplus::StringFormat sf;
-        sf.SetAlignment(Gdiplus::StringAlignmentCenter);
-        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        g.DrawString(L"\u25B6\u2006Start Processing", -1, &font, tr, &sf, &tb);
-        return;
+            // Label text
+            HFONT hf = g_hFont ? g_hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            Gdiplus::Font font(memDC, hf);
+            Gdiplus::RectF tr(bx, by, bw, bh);
+            Gdiplus::StringFormat sf;
+            sf.SetAlignment(Gdiplus::StringAlignmentCenter);
+            sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            Gdiplus::SolidBrush tb(Gdiplus::Color(235, 255, 255, 255));
+            if (done) {
+                g.DrawString(L"\u2713\u2006Done", -1, &font, tr, &sf, &tb);
+            } else {
+                wchar_t label[32];
+                StringCchPrintfW(label, 32, L"Processing\u2026 %d%%", (int)(prog * 100.0f));
+                g.DrawString(label, -1, &font, tr, &sf, &tb);
+            }
+        } else {
+            // Idle / normal teal button
+            Gdiplus::Color c1, c2;
+            if      (disabled) { c1 = Gdiplus::Color(255, 34, 50, 48);   c2 = Gdiplus::Color(255, 26, 38, 36); }
+            else if (pressed)  { c1 = Gdiplus::Color(255, 16, 108, 98);  c2 = Gdiplus::Color(255, 12, 84, 76); }
+            else               { c1 = Gdiplus::Color(255, 28, 152, 138); c2 = Gdiplus::Color(255, 20, 118, 106); }
+
+            Gdiplus::LinearGradientBrush lgb(
+                Gdiplus::PointF(0.0f, by), Gdiplus::PointF(0.0f, by + bh), c1, c2);
+            g.FillPath(&lgb, &path);
+            if (!disabled) {
+                Gdiplus::Pen pen(Gdiplus::Color(90, 100, 255, 220), 1.0f);
+                g.DrawPath(&pen, &path);
+            }
+
+            BYTE ta = disabled ? 85 : 235;
+            Gdiplus::SolidBrush tb(Gdiplus::Color(ta, 220, 255, 248));
+            HFONT hf = g_hFont ? g_hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            Gdiplus::Font font(memDC, hf);
+            Gdiplus::RectF tr(bx, by, bw, bh);
+            Gdiplus::StringFormat sf;
+            sf.SetAlignment(Gdiplus::StringAlignmentCenter);
+            sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            g.DrawString(L"\u25B6\u2006Start Processing", -1, &font, tr, &sf, &tb);
+        }
     }
 
     // ---- Resolution dropdown button ----
-    if (id == IDC_RES_DROPDOWN) {
+    else if (id == IDC_RES_DROPDOWN) {
         float r  = H * 0.5f - 1.0f;
         Gdiplus::Color bgCol = disabled ? GdipColor(g_theme.pillDisabled)
                              : pressed  ? GdipColor(g_theme.pillPressed)
@@ -632,7 +726,7 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
 
         float chevW = 18.0f;
         HFONT hf = g_hFont ? g_hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        Gdiplus::Font font(dis->hDC, hf);
+        Gdiplus::Font font(memDC, hf);
         Gdiplus::SolidBrush tb(Gdiplus::Color(a, 215, 220, 232));
         Gdiplus::RectF textRect(bx + 10.0f, by, bw - chevW - 10.0f, bh);
         Gdiplus::StringFormat sf;
@@ -647,10 +741,10 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
         Gdiplus::SolidBrush cb(Gdiplus::Color(a, 150, 155, 175));
         Gdiplus::PointF chevPts[3] = { {cvx-4.5f, cy2-2.5f}, {cvx+4.5f, cy2-2.5f}, {cvx, cy2+3.0f} };
         g.FillPolygon(&cb, chevPts, 3);
-        return;
     }
 
     // ---- Player icon buttons — pill ----
+    else {
     float r  = H * 0.5f - 1.0f;
 
     {
@@ -726,6 +820,14 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
         g.DrawLine(&pen, cx + 9.0f, cy - 8.0f, cx + 4.5f, cy - 8.0f);
         g.DrawLine(&pen, cx + 9.0f, cy + 8.0f, cx + 4.5f, cy + 8.0f);
     }
+    }   // end else (player buttons)
+    }   // end Graphics scope — GDI+ content flushed to memDC
+
+    // Atomic blit to screen: single operation, no visible intermediate state
+    BitBlt(dis->hDC, 0, 0, W, H, memDC, 0, 0, SRCCOPY);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(memBmp);
+    DeleteDC(memDC);
 }
 
 // ------------------------------ Persistent Settings ------------------------------
@@ -1395,17 +1497,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 convertHdrToSdr = (colorSel == 1);  // index 1 = "Convert to SDR"
             }
 
+            // Launch transcoding on a background thread so the UI stays responsive.
             EnableWindow(g_hStartButton, FALSE);
-            bool ok = TranscodeWithSizeAndScale(g_inputPath, outPath, targetSizeMB, scaleFactor,
-                g_vidWidth, g_vidHeight, startSecs, endSecs, selAudio, selSubs, convertHdrToSdr);
-            if (ok) {
-                std::string msg = "Successfully created:\n"; msg += outPath;
-                MessageBoxA(hwnd, msg.c_str(), "Success", MB_ICONINFORMATION);
-            }
-            else {
-                MessageBox(hwnd, L"Transcoding failed. See debug output for details.", L"Error", MB_ICONERROR);
-            }
-            EnableWindow(g_hStartButton, TRUE);
+            StopPlayback();
+
+            EncodeArgs* args = new EncodeArgs{};
+            StringCchCopyA(args->inPath,  MAX_PATH, g_inputPath);
+            StringCchCopyA(args->outPath, MAX_PATH, outPath);
+            args->targetSizeMB   = targetSizeMB;
+            args->scaleFactor    = scaleFactor;
+            args->origW          = g_vidWidth;
+            args->origH          = g_vidHeight;
+            args->startSecs      = startSecs;
+            args->endSecs        = endSecs;
+            args->selAudio       = selAudio;
+            args->selSubs        = selSubs;
+            args->convertHdrToSdr = convertHdrToSdr;
+            args->hwnd           = hwnd;
+
+            g_encodeProgress = 0.0f;
+            g_encodeRunning  = true;
+            InvalidateRect(g_hStartButton, nullptr, TRUE);
+            SetTimer(hwnd, IDT_ENCODE_PROGRESS, 100, nullptr);
+
+            if (g_encodeThread) { CloseHandle(g_encodeThread); g_encodeThread = nullptr; }
+            g_encodeThread = (HANDLE)_beginthreadex(nullptr, 0, EncodeThreadProc, args, 0, nullptr);
         }
 
         if (id == IDC_BTN_PLAYPAUSE && g_playerReady) {
@@ -1437,6 +1553,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             UpdateSeekbarFromPos();
             if (g_isPlaying) InvalidateRect(hwnd, nullptr, FALSE);
         }
+        if (wParam == IDT_ENCODE_PROGRESS) {
+            // Repaint the button to update the progress fill
+            InvalidateRect(g_hStartButton, nullptr, FALSE);
+            UpdateWindow(g_hStartButton);
+        }
+        break;
+    }
+
+    case WM_APP_ENCODE_DONE: {
+        KillTimer(hwnd, IDT_ENCODE_PROGRESS);
+        if (g_encodeThread) { CloseHandle(g_encodeThread); g_encodeThread = nullptr; }
+
+        // Show "Done" state briefly, then re-enable
+        InvalidateRect(g_hStartButton, nullptr, TRUE);
+        UpdateWindow(g_hStartButton);
+
+        bool ok = (wParam != 0);
+        if (ok) {
+            std::string msg = "Successfully created:\n";
+            msg += g_encodeOutPath;
+            MessageBoxA(hwnd, msg.c_str(), "Done", MB_ICONINFORMATION);
+        } else {
+            MessageBox(hwnd, L"Transcoding failed. See debug output for details.", L"Error", MB_ICONERROR);
+        }
+
+        g_encodeProgress = 0.0f;
+        g_encodeRunning  = false;
+        EnableWindow(g_hStartButton, TRUE);
+        InvalidateRect(g_hStartButton, nullptr, TRUE);
         break;
     }
 
@@ -1507,6 +1652,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hBkBrush)     { DeleteObject(g_hBkBrush);    g_hBkBrush     = nullptr; }
         if (g_hEditBrush)   { DeleteObject(g_hEditBrush);  g_hEditBrush   = nullptr; }
         if (g_hwDeviceCtx)  { av_buffer_unref(&g_hwDeviceCtx); g_hwDeviceCtx = nullptr; }
+        if (g_encodeThread) { CloseHandle(g_encodeThread); g_encodeThread = nullptr; }
         PostQuitMessage(0);
         break;
 
@@ -2746,6 +2892,10 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 // Drop frames that still decode before the requested start
                 if (in_time < start_seconds) { av_frame_unref(frame); continue; }
                 if (in_time > end_seconds) { av_frame_unref(frame); goto flush_encoder; }
+
+                // Update encode progress for the button's progress bar
+                if (end_seconds > start_seconds)
+                    g_encodeProgress = (float)((in_time - start_seconds) / (end_seconds - start_seconds));
 
                 // Transfer NVDEC hardware frame to CPU memory if needed.
                 AVFrame* sw_frame = frame;
