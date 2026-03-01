@@ -13,6 +13,8 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <future>
+#include <thread>
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
 #include <dwmapi.h>
@@ -33,6 +35,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
 #include <libavutil/dict.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
@@ -163,6 +166,10 @@ static int      g_hdrTrc           = 0;   // AVColorTransferCharacteristic of so
 static uint8_t  g_hdrDisplay8Lut[256] = {};
 static bool     g_hdrLutValid      = false;
 
+// Hardware acceleration (NVDEC/NVENC)
+static AVBufferRef* g_hwDeviceCtx   = nullptr;  // CUDA device; null = no NVDEC available
+static bool         g_nvdecAvailable = false;
+
 // ------------------------------ Theme ------------------------------
 struct AppTheme {
     COLORREF bk;           // window / panel background
@@ -227,6 +234,47 @@ void StepBackward(HWND hwnd);
 void UpdateSeekbarFromPos();
 void SetMarkInFromCurrent(HWND hwnd);
 void SetMarkOutFromCurrent(HWND hwnd);
+
+// ------------------------------ NVIDIA Hardware Acceleration ------------------------------
+static const char* get_cuvid_name(AVCodecID id) {
+    switch (id) {
+        case AV_CODEC_ID_H264:       return "h264_cuvid";
+        case AV_CODEC_ID_HEVC:       return "hevc_cuvid";
+        case AV_CODEC_ID_AV1:        return "av1_cuvid";
+        case AV_CODEC_ID_VP9:        return "vp9_cuvid";
+        case AV_CODEC_ID_VP8:        return "vp8_cuvid";
+        case AV_CODEC_ID_MPEG2VIDEO: return "mpeg2_cuvid";
+        case AV_CODEC_ID_MPEG4:      return "mpeg4_cuvid";
+        case AV_CODEC_ID_VC1:        return "vc1_cuvid";
+        default: return nullptr;
+    }
+}
+
+static AVPixelFormat get_hw_format(AVCodecContext*, const AVPixelFormat* pix_fmts) {
+    for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++)
+        if (*p == AV_PIX_FMT_CUDA) return AV_PIX_FMT_CUDA;
+    return pix_fmts[0];
+}
+
+static void TryInitHWDevice() {
+    if (av_hwdevice_ctx_create(&g_hwDeviceCtx, AV_HWDEVICE_TYPE_CUDA,
+                               nullptr, nullptr, 0) >= 0)
+        g_nvdecAvailable = true;
+}
+
+// Returns best decoder for codec_id: cuvid (NVDEC) if available, else software.
+// Sets using_hw=true when a hardware decoder was found.
+static const AVCodec* find_best_decoder(AVCodecID id, bool& using_hw) {
+    using_hw = false;
+    if (g_nvdecAvailable) {
+        const char* name = get_cuvid_name(id);
+        if (name) {
+            const AVCodec* hw = avcodec_find_decoder_by_name(name);
+            if (hw) { using_hw = true; return hw; }
+        }
+    }
+    return avcodec_find_decoder(id);
+}
 
 // ------------------------------ UI Layout ------------------------------
 void HandleResize(HWND hwnd, int clientW, int clientH) {
@@ -978,6 +1026,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         addTip(g_hBtnMarkIn,    L"Set clip start to current position  [I]");
         addTip(g_hBtnMarkOut,   L"Set clip end to current position  [O]");
 
+        // Try to initialise CUDA device for NVDEC hardware decoding.
+        TryInitHWDevice();
+
         // Restore saved settings from the registry
         LoadSettings();
 
@@ -1455,6 +1506,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hLabelFont)   { DeleteObject(g_hLabelFont);   g_hLabelFont   = nullptr; }
         if (g_hBkBrush)     { DeleteObject(g_hBkBrush);    g_hBkBrush     = nullptr; }
         if (g_hEditBrush)   { DeleteObject(g_hEditBrush);  g_hEditBrush   = nullptr; }
+        if (g_hwDeviceCtx)  { av_buffer_unref(&g_hwDeviceCtx); g_hwDeviceCtx = nullptr; }
         PostQuitMessage(0);
         break;
 
@@ -1611,6 +1663,32 @@ static const double k_bt2020_to_bt709[3][3] = {
     {-0.1246,  1.1329, -0.0083 },
     {-0.0182, -0.1006,  1.1187 }
 };
+// Float copy for vectorisable inner loops
+static const float k_bt2020_to_bt709f[3][3] = {
+    { 1.6605f, -0.5876f, -0.0728f },
+    {-0.1246f,  1.1329f, -0.0083f },
+    {-0.0182f, -0.1006f,  1.1187f }
+};
+
+// ----- Tone-mapping LUTs for fast transcode (built once per encode session) -----
+// s_eotf_lut[i] = EOTF(i/65535) — eliminates all pow() calls in Stage 2.
+static float   s_eotf_lut[65536]   = {};
+// s_srgb_lut16[i] = sRGB_encode(i/65535) as uint8 — eliminates sRGB pow() calls.
+static uint8_t s_srgb_lut16[65536] = {};
+static bool    s_srgb_lut_ready    = false;
+
+// Call once before each HDR→SDR encode with the source transfer characteristic.
+static void BuildToneMappingLuts(bool isPQ) {
+    for (int i = 0; i < 65536; i++) {
+        double v = i / 65535.0;
+        s_eotf_lut[i] = isPQ ? (float)pq_eotf(v) : (float)hlg_eotf(v);
+    }
+    if (!s_srgb_lut_ready) {
+        for (int i = 0; i < 65536; i++)
+            s_srgb_lut16[i] = srgb_pack(i / 65535.0);
+        s_srgb_lut_ready = true;
+    }
+}
 
 // Build an 8-bit LUT for fast display tone-mapping in the playback thread.
 // sws_scale to BGR24 from an HDR source outputs PQ/HLG-encoded values linearly
@@ -1660,6 +1738,7 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     AVPacket* pkt = nullptr;
     AVFrame* frame = nullptr;
     AVFrame* rgbFrame = nullptr;
+    AVFrame* cpu_frame = nullptr;   // for NVDEC hw→cpu transfer
     int64_t middle_ts = 0;
     uint8_t* rgbBuffer = nullptr;
     HBITMAP hBitmap = nullptr;
@@ -1667,6 +1746,7 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     AVStream* videoStream = nullptr;
     const AVCodec* decoder = nullptr;
     bool gotFrame = false;
+    bool using_hw = false;
     int rgbBufSize = 0;
     BITMAPINFO bmi = {};
     HDC hdc = nullptr;
@@ -1680,11 +1760,15 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     if (videoStreamIndex < 0) goto cleanup;
     videoStream = fmt_ctx->streams[videoStreamIndex];
 
-    decoder = avcodec_find_decoder(videoStream->codecpar->codec_id);
+    decoder = find_best_decoder(videoStream->codecpar->codec_id, using_hw);
     if (!decoder) goto cleanup;
     dec_ctx = avcodec_alloc_context3(decoder);
     if (!dec_ctx) goto cleanup;
     if (avcodec_parameters_to_context(dec_ctx, videoStream->codecpar) < 0) goto cleanup;
+    if (using_hw) {
+        dec_ctx->hw_device_ctx = av_buffer_ref(g_hwDeviceCtx);
+        dec_ctx->get_format    = get_hw_format;
+    }
     if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) goto cleanup;
 
     middle_ts = (int64_t)((duration / 2.0) * AV_TIME_BASE);
@@ -1697,10 +1781,8 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     pkt = av_packet_alloc();
     if (!pkt) goto cleanup;
 
-    sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws_ctx) goto cleanup;
+    // sws_ctx and rgbBuffer are created lazily on the first decoded frame because
+    // with NVDEC the pixel format is not known until av_hwframe_transfer_data runs.
     rgbBufSize = av_image_get_buffer_size(AV_PIX_FMT_BGR24, dec_ctx->width, dec_ctx->height, 1);
     rgbBuffer = (uint8_t*)av_malloc(rgbBufSize);
     if (!rgbBuffer) goto cleanup;
@@ -1711,16 +1793,34 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
         if (pkt->stream_index == videoStreamIndex) {
             if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
             if (avcodec_receive_frame(dec_ctx, frame) == 0) {
-                bool isPQ  = (frame->color_trc == AVCOL_TRC_SMPTE2084);
-                bool isHLG = (frame->color_trc == AVCOL_TRC_ARIB_STD_B67);
+                // Transfer NVDEC hardware frame to CPU memory if needed.
+                AVFrame* sw_frame = frame;
+                if (using_hw && frame->format == AV_PIX_FMT_CUDA) {
+                    if (!cpu_frame) cpu_frame = av_frame_alloc();
+                    if (cpu_frame && av_hwframe_transfer_data(cpu_frame, frame, 0) >= 0) {
+                        cpu_frame->color_trc   = frame->color_trc;
+                        cpu_frame->colorspace  = frame->colorspace;
+                        cpu_frame->color_range = frame->color_range;
+                        sw_frame = cpu_frame;
+                    }
+                }
+                // Lazy-init sws_ctx now that we know the actual pixel format.
+                if (!sws_ctx) {
+                    sws_ctx = sws_getContext(
+                        sw_frame->width, sw_frame->height, (AVPixelFormat)sw_frame->format,
+                        sw_frame->width, sw_frame->height, AV_PIX_FMT_BGR24,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                }
+                bool isPQ  = (sw_frame->color_trc == AVCOL_TRC_SMPTE2084);
+                bool isHLG = (sw_frame->color_trc == AVCOL_TRC_ARIB_STD_B67);
                 if (isPQ || isHLG) {
                     // Full-quality HDR→SDR: decode → RGB48LE → EOTF+matrix+TM → sRGB
-                    int srcCs = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
-                                 frame->colorspace == AVCOL_SPC_BT2020_CL)
+                    int srcCs = (sw_frame->colorspace == AVCOL_SPC_BT2020_NCL ||
+                                 sw_frame->colorspace == AVCOL_SPC_BT2020_CL)
                                 ? SWS_CS_BT2020 : SWS_CS_ITU709;
-                    int srcRange = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+                    int srcRange = (sw_frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
                     SwsContext* hdr_sws = sws_getContext(
-                        dec_ctx->width, dec_ctx->height, (AVPixelFormat)frame->format,
+                        dec_ctx->width, dec_ctx->height, (AVPixelFormat)sw_frame->format,
                         dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB48LE,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
                     if (hdr_sws) {
@@ -1732,7 +1832,7 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
                         uint8_t* rgb48 = (uint8_t*)av_malloc((size_t)dec_ctx->height * stride48);
                         if (rgb48) {
                             uint8_t* d[1] = { rgb48 }; int s[1] = { stride48 };
-                            sws_scale(hdr_sws, frame->data, frame->linesize,
+                            sws_scale(hdr_sws, sw_frame->data, sw_frame->linesize,
                                       0, dec_ctx->height, d, s);
                             double refW = isPQ ? 0.0203 : 0.25;
                             for (int row = 0; row < dec_ctx->height; row++) {
@@ -1762,9 +1862,11 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
                         sws_freeContext(hdr_sws);
                     }
                 } else {
-                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
-                        rgbFrame->data, rgbFrame->linesize);
-                    gotFrame = true;
+                    if (sws_ctx) {
+                        sws_scale(sws_ctx, sw_frame->data, sw_frame->linesize, 0, dec_ctx->height,
+                            rgbFrame->data, rgbFrame->linesize);
+                        gotFrame = true;
+                    }
                 }
                 av_frame_unref(frame);
                 av_packet_unref(pkt);
@@ -1797,6 +1899,7 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
 
 cleanup:
     if (sws_ctx) sws_freeContext(sws_ctx);
+    if (cpu_frame) av_frame_free(&cpu_frame);
     if (frame) av_frame_free(&frame);
     if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
     if (pkt) av_packet_free(&pkt);
@@ -1818,11 +1921,13 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
     AVPacket* pkt = nullptr;
     AVFrame* frame = nullptr;
     AVFrame* rgbFrame = nullptr;
+    AVFrame* cpu_frame = nullptr;   // for NVDEC hw→cpu transfer
     int              videoStreamIndex = -1;
     AVStream* videoStream = nullptr;
     const AVCodec* decoder = nullptr;
     uint8_t* rgbBuffer = nullptr;
     int              rgbBufSize = 0;
+    bool             using_hw = false;
 
     bool init_ok = false;
     do {
@@ -1834,17 +1939,19 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
         if (videoStreamIndex < 0) break;
         videoStream = fmt_ctx->streams[videoStreamIndex];
 
-        decoder = avcodec_find_decoder(videoStream->codecpar->codec_id);
+        decoder = find_best_decoder(videoStream->codecpar->codec_id, using_hw);
         if (!decoder) break;
         dec_ctx = avcodec_alloc_context3(decoder);
         if (!dec_ctx) break;
         if (avcodec_parameters_to_context(dec_ctx, videoStream->codecpar) < 0) break;
+        if (using_hw) {
+            dec_ctx->hw_device_ctx = av_buffer_ref(g_hwDeviceCtx);
+            dec_ctx->get_format    = get_hw_format;
+        }
         if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) break;
 
-        sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-            dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws_ctx) break;
+        // sws_ctx is created lazily on the first frame so we get the real pixel
+        // format after NVDEC hw→cpu transfer (dec_ctx->pix_fmt == CUDA with hw).
 
         frame = av_frame_alloc();
         rgbFrame = av_frame_alloc();
@@ -1903,8 +2010,24 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                 if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
 
                 while (avcodec_receive_frame(dec_ctx, frame) == 0) {
-                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
-                        rgbFrame->data, rgbFrame->linesize);
+                    // Transfer NVDEC hardware frame to CPU memory if needed.
+                    AVFrame* sw_frame = frame;
+                    if (using_hw && frame->format == AV_PIX_FMT_CUDA) {
+                        if (!cpu_frame) cpu_frame = av_frame_alloc();
+                        if (cpu_frame && av_hwframe_transfer_data(cpu_frame, frame, 0) >= 0)
+                            sw_frame = cpu_frame;
+                    }
+                    // Lazy-init sws_ctx on first decoded frame.
+                    if (!sws_ctx) {
+                        sws_ctx = sws_getContext(
+                            sw_frame->width, sw_frame->height, (AVPixelFormat)sw_frame->format,
+                            sw_frame->width, sw_frame->height, AV_PIX_FMT_BGR24,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    }
+                    if (sws_ctx) {
+                        sws_scale(sws_ctx, sw_frame->data, sw_frame->linesize, 0, dec_ctx->height,
+                            rgbFrame->data, rgbFrame->linesize);
+                    }
                     if (g_isHdr && g_hdrLutValid) {
                         for (int row = 0; row < dec_ctx->height; row++) {
                             uint8_t* p = rgbFrame->data[0] + row * rgbFrame->linesize[0];
@@ -2015,8 +2138,24 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             continue;
         }
         while (avcodec_receive_frame(dec_ctx, frame) == 0) {
-            sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
-                rgbFrame->data, rgbFrame->linesize);
+            // Transfer NVDEC hardware frame to CPU memory if needed.
+            AVFrame* sw_frame = frame;
+            if (using_hw && frame->format == AV_PIX_FMT_CUDA) {
+                if (!cpu_frame) cpu_frame = av_frame_alloc();
+                if (cpu_frame && av_hwframe_transfer_data(cpu_frame, frame, 0) >= 0)
+                    sw_frame = cpu_frame;
+            }
+            // Lazy-init sws_ctx on first decoded frame.
+            if (!sws_ctx) {
+                sws_ctx = sws_getContext(
+                    sw_frame->width, sw_frame->height, (AVPixelFormat)sw_frame->format,
+                    sw_frame->width, sw_frame->height, AV_PIX_FMT_BGR24,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+            }
+            if (sws_ctx) {
+                sws_scale(sws_ctx, sw_frame->data, sw_frame->linesize, 0, dec_ctx->height,
+                    rgbFrame->data, rgbFrame->linesize);
+            }
             if (g_isHdr && g_hdrLutValid) {
                 for (int row = 0; row < dec_ctx->height; row++) {
                     uint8_t* p = rgbFrame->data[0] + row * rgbFrame->linesize[0];
@@ -2063,6 +2202,7 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
 
     // cleanup
     if (pkt) av_packet_free(&pkt);
+    if (cpu_frame) av_frame_free(&cpu_frame);
     if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
     if (frame) av_frame_free(&frame);
     if (sws_ctx) sws_freeContext(sws_ctx);
@@ -2210,7 +2350,10 @@ void SetMarkOutFromCurrent(HWND hwnd) {
 
 // Bitmap subtitle types (PGS, VOBSUB) are pre-decoded to these structs and
 // alpha-blended directly onto YUV frames; text-based subs go through libavfilter/libass.
-struct PgsRect  { int x, y, w, h; std::vector<uint8_t> bgra; };
+// x/y/w/h are at OUTPUT (encoder) resolution; yuva holds [Y,Cb,Cr,A] per pixel,
+// pre-converted at load time so the per-frame blend loop needs no float math or
+// colour conversion.
+struct PgsRect  { int x, y, w, h; std::vector<uint8_t> yuva; };
 struct PgsEvent { int64_t pts_ms;  std::vector<PgsRect> rects; }; // rects.empty() = clear screen
 
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
@@ -2244,9 +2387,11 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     int               audioStreamIndex = -1;
     AVFrame*          frame            = nullptr;
     AVFrame*          filt_frame       = nullptr;
+    AVFrame*          cpu_frame        = nullptr;   // for NVDEC hw→cpu transfer
     AVPacket*         pkt              = nullptr;
     AVPacket*         enc_pkt          = nullptr;
     bool              success          = false;
+    bool              using_hw         = false;
     int64_t           video_start_pts  = 0;
     int64_t           audio_start_pts  = 0;
 
@@ -2286,11 +2431,15 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     }
     if (target_bitrate <= 0) { OutputDebugStringA("Invalid target bitrate calculated.\n"); goto cleanup; }
 
-    video_decoder = avcodec_find_decoder(video_in_stream->codecpar->codec_id);
+    video_decoder = find_best_decoder(video_in_stream->codecpar->codec_id, using_hw);
     if (!video_decoder) { OutputDebugStringA("Video decoder not found.\n"); goto cleanup; }
     dec_ctx = avcodec_alloc_context3(video_decoder);
     if (!dec_ctx) { OutputDebugStringA("Failed to allocate video decoder context.\n"); goto cleanup; }
     if (avcodec_parameters_to_context(dec_ctx, video_in_stream->codecpar) < 0) { OutputDebugStringA("Failed to copy video params to decoder.\n"); goto cleanup; }
+    if (using_hw) {
+        dec_ctx->hw_device_ctx = av_buffer_ref(g_hwDeviceCtx);
+        dec_ctx->get_format    = get_hw_format;
+    }
     if (avcodec_open2(dec_ctx, video_decoder, nullptr) < 0) { OutputDebugStringA("Failed to open video decoder.\n"); goto cleanup; }
 
     avformat_alloc_output_context2(&out_fmt_ctx, nullptr, nullptr, out_filename);
@@ -2370,30 +2519,16 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     pkt = av_packet_alloc();
     enc_pkt = av_packet_alloc();
     if (!frame || !filt_frame || !pkt || !enc_pkt) { OutputDebugStringA("Could not allocate frame/packet.\n"); goto cleanup; }
-    sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-        enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws_ctx) { OutputDebugStringA("Could not initialize SwsContext.\n"); goto cleanup; }
+    // sws_ctx is created lazily on the first decoded frame because with NVDEC the
+    // pixel format (dec_ctx->pix_fmt) is AV_PIX_FMT_CUDA until hw→cpu transfer reveals it.
     filt_frame->format = enc_ctx->pix_fmt;
     filt_frame->width = enc_ctx->width;
     filt_frame->height = enc_ctx->height;
     if (av_frame_get_buffer(filt_frame, 32) < 0) { OutputDebugStringA("Could not allocate buffer for scaled frame.\n"); goto cleanup; }
 
     if (convert_hdr_to_sdr) {
-        // Stage 1: decode native → RGB48LE with BT.2020 input colorspace
-        int srcCs    = (dec_ctx->colorspace == AVCOL_SPC_BT2020_NCL ||
-                        dec_ctx->colorspace == AVCOL_SPC_BT2020_CL)
-                       ? SWS_CS_BT2020 : SWS_CS_ITU709;
-        int srcRange = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
-        sws_hdr2rgb = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-            enc_ctx->width, enc_ctx->height, AV_PIX_FMT_RGB48LE,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (sws_hdr2rgb) {
-            sws_setColorspaceDetails(sws_hdr2rgb,
-                sws_getCoefficients(srcCs),        srcRange,
-                sws_getCoefficients(SWS_CS_ITU709), 1,
-                0, 1 << 16, 1 << 16);
-        }
+        // Stage 1 (sws_hdr2rgb) is created lazily on first frame — input pixel format
+        // is not known until after hw→cpu transfer.
         // Stage 3: BGR24 (BT.709 full-range) → encoder YUV (BT.709 limited-range)
         sws_rgb2yuv = sws_getContext(enc_ctx->width, enc_ctx->height, AV_PIX_FMT_BGR24,
             enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
@@ -2406,10 +2541,12 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         }
         hdr_rgb48_buf = (uint8_t*)av_malloc((size_t)enc_ctx->height * enc_ctx->width * 6);
         hdr_bgr24_buf = (uint8_t*)av_malloc((size_t)enc_ctx->height * enc_ctx->width * 3);
-        if (!sws_hdr2rgb || !sws_rgb2yuv || !hdr_rgb48_buf || !hdr_bgr24_buf) {
-            OutputDebugStringA("HDR→SDR setup failed; falling back to direct encode.\n");
+        if (!sws_rgb2yuv || !hdr_rgb48_buf || !hdr_bgr24_buf) {
+            OutputDebugStringA("HDR→SDR pre-setup failed; falling back to direct encode.\n");
             convert_hdr_to_sdr = false;
         } else {
+            // Pre-build EOTF + sRGB LUTs so Stage 2 uses table lookups instead of pow().
+            BuildToneMappingLuts(g_hdrTrc == AVCOL_TRC_SMPTE2084);
             // Tag output as BT.709 so players know it's been tone-mapped
             video_out_stream->codecpar->color_primaries = AVCOL_PRI_BT709;
             video_out_stream->codecpar->color_trc       = AVCOL_TRC_BT709;
@@ -2446,6 +2583,13 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                                 int got_sub = 0;
                                 avcodec_decode_subtitle2(sub_dec, &sub, &got_sub, sub_pkt);
                                 if (got_sub) {
+                                    // PGS codec sets sub_dec->width/height from the PCS segment
+                                    // during avcodec_decode_subtitle2, not before. Refresh here
+                                    // so the scaling below uses the correct authored plane size
+                                    // (e.g. 1920×1080 for 4K Blu-ray with 1080p PGS track).
+                                    if (sub_dec->width  > 0) pgs_plane_w = sub_dec->width;
+                                    if (sub_dec->height > 0) pgs_plane_h = sub_dec->height;
+
                                     // AVSubtitle.pts is in microseconds (AV_TIME_BASE)
                                     int64_t s_ms = (sub.pts != AV_NOPTS_VALUE)
                                         ? sub.pts / 1000
@@ -2455,19 +2599,35 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                                     for (unsigned ri = 0; ri < sub.num_rects; ri++) {
                                         AVSubtitleRect* rect = sub.rects[ri];
                                         if (rect->type == SUBTITLE_BITMAP && rect->w > 0 && rect->h > 0) {
+                                            // Pre-scale to output resolution and pre-convert
+                                            // palette → [Y, Cb, Cr, A].  Doing this once at load
+                                            // time removes all float coordinate math and per-pixel
+                                            // colour conversion from the per-frame blend loop.
+                                            int srcRefW = (pgs_plane_w > 0) ? pgs_plane_w : dec_ctx->width;
+                                            int srcRefH = (pgs_plane_h > 0) ? pgs_plane_h : dec_ctx->height;
+                                            double psx = (srcRefW > 0) ? (double)enc_ctx->width  / srcRefW : 1.0;
+                                            double psy = (srcRefH > 0) ? (double)enc_ctx->height / srcRefH : 1.0;
                                             PgsRect pr;
-                                            pr.x = rect->x; pr.y = rect->y;
-                                            pr.w = rect->w; pr.h = rect->h;
-                                            pr.bgra.resize((size_t)pr.w * pr.h * 4);
+                                            pr.x = (int)(rect->x * psx);
+                                            pr.y = (int)(rect->y * psy);
+                                            pr.w = max(1, (int)(rect->w * psx + 0.5));
+                                            pr.h = max(1, (int)(rect->h * psy + 0.5));
+                                            pr.yuva.resize((size_t)pr.w * pr.h * 4);
                                             uint8_t* pal = rect->data[1]; // BGRA palette (256 × 4 bytes)
-                                            for (int py = 0; py < pr.h; py++) {
-                                                for (int px = 0; px < pr.w; px++) {
-                                                    uint8_t idx = rect->data[0][py * rect->linesize[0] + px];
-                                                    uint8_t* dst = pr.bgra.data() + ((size_t)py * pr.w + px) * 4;
-                                                    dst[0] = pal[idx * 4 + 0]; // B
-                                                    dst[1] = pal[idx * 4 + 1]; // G
-                                                    dst[2] = pal[idx * 4 + 2]; // R
-                                                    dst[3] = pal[idx * 4 + 3]; // A
+                                            for (int dy = 0; dy < pr.h; dy++) {
+                                                int sy_s = min(rect->h - 1, (int)((dy + 0.5) * rect->h / pr.h));
+                                                for (int dx = 0; dx < pr.w; dx++) {
+                                                    int sx_s = min(rect->w - 1, (int)((dx + 0.5) * rect->w / pr.w));
+                                                    uint8_t idx = rect->data[0][sy_s * rect->linesize[0] + sx_s];
+                                                    uint8_t b = pal[idx * 4 + 0];
+                                                    uint8_t g = pal[idx * 4 + 1];
+                                                    uint8_t r = pal[idx * 4 + 2];
+                                                    uint8_t a = pal[idx * 4 + 3];
+                                                    uint8_t* dst = pr.yuva.data() + ((size_t)dy * pr.w + dx) * 4;
+                                                    dst[0] = (uint8_t)max(16, min(235, (( 66*r + 129*g +  25*b + 128) >> 8) + 16));
+                                                    dst[1] = (uint8_t)max(16, min(240, ((-38*r -  74*g + 112*b + 128) >> 8) + 128));
+                                                    dst[2] = (uint8_t)max(16, min(240, ((112*r -  94*g -  18*b + 128) >> 8) + 128));
+                                                    dst[3] = a;
                                                 }
                                             }
                                             ev.rects.push_back(std::move(pr));
@@ -2503,9 +2663,14 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 char src_args[256];
                 AVRational tb  = video_in_stream->time_base;
                 AVRational sar = dec_ctx->sample_aspect_ratio;
+                // With NVDEC, dec_ctx->pix_fmt == AV_PIX_FMT_CUDA; use the stream's
+                // software format instead so buffersrc gets a valid pixel format.
+                AVPixelFormat filter_fmt = using_hw
+                    ? (AVPixelFormat)video_in_stream->codecpar->format
+                    : dec_ctx->pix_fmt;
                 snprintf(src_args, sizeof(src_args),
                     "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-                    dec_ctx->width, dec_ctx->height, (int)dec_ctx->pix_fmt,
+                    dec_ctx->width, dec_ctx->height, (int)filter_fmt,
                     tb.num, tb.den, sar.num ? sar.num : 1, sar.den ? sar.den : 1);
 
                 int ret = avfilter_graph_create_filter(&buffersrc_ctx,  buffersrc,  "in",  src_args, nullptr, filter_graph);
@@ -2582,17 +2747,59 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 if (in_time < start_seconds) { av_frame_unref(frame); continue; }
                 if (in_time > end_seconds) { av_frame_unref(frame); goto flush_encoder; }
 
+                // Transfer NVDEC hardware frame to CPU memory if needed.
+                AVFrame* sw_frame = frame;
+                if (using_hw && frame->format == AV_PIX_FMT_CUDA) {
+                    if (!cpu_frame) cpu_frame = av_frame_alloc();
+                    if (cpu_frame && av_hwframe_transfer_data(cpu_frame, frame, 0) >= 0) {
+                        cpu_frame->pts                  = frame->pts;
+                        cpu_frame->best_effort_timestamp = frame->best_effort_timestamp;
+                        cpu_frame->color_trc            = frame->color_trc;
+                        cpu_frame->colorspace           = frame->colorspace;
+                        cpu_frame->color_range          = frame->color_range;
+                        sw_frame = cpu_frame;
+                    }
+                }
+
+                // Lazy-init sws_ctx (non-HDR path) on first decoded frame.
+                if (!sws_ctx) {
+                    sws_ctx = sws_getContext(
+                        dec_ctx->width, dec_ctx->height, (AVPixelFormat)sw_frame->format,
+                        enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                }
+                // Lazy-init sws_hdr2rgb (HDR→SDR Stage 1) on first decoded frame.
+                if (convert_hdr_to_sdr && !sws_hdr2rgb) {
+                    int srcCs    = (dec_ctx->colorspace == AVCOL_SPC_BT2020_NCL ||
+                                    dec_ctx->colorspace == AVCOL_SPC_BT2020_CL)
+                                   ? SWS_CS_BT2020 : SWS_CS_ITU709;
+                    int srcRange = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+                    sws_hdr2rgb = sws_getContext(
+                        dec_ctx->width, dec_ctx->height, (AVPixelFormat)sw_frame->format,
+                        enc_ctx->width, enc_ctx->height, AV_PIX_FMT_RGB48LE,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    if (sws_hdr2rgb) {
+                        sws_setColorspaceDetails(sws_hdr2rgb,
+                            sws_getCoefficients(srcCs),         srcRange,
+                            sws_getCoefficients(SWS_CS_ITU709), 1,
+                            0, 1 << 16, 1 << 16);
+                    } else {
+                        OutputDebugStringA("HDR→SDR sws_hdr2rgb init failed; falling back.\n");
+                        convert_hdr_to_sdr = false;
+                    }
+                }
+
                 // Rebase video PTS to 0 at start_seconds, then convert to encoder time_base
                 int64_t rel_vid_pts = in_pts - video_start_pts;
                 if (rel_vid_pts < 0) rel_vid_pts = 0;
                 filt_frame->pts = av_rescale_q(rel_vid_pts, video_in_stream->time_base, enc_ctx->time_base);
 
                 // Route through subtitle filter graph if active, otherwise scale directly
-                AVFrame* src_frame = frame;
+                AVFrame* src_frame = sw_frame;
                 AVFrame* filter_out = nullptr;
                 if (use_filter) {
-                    frame->pts = in_pts; // filter needs original pts for subtitle timing
-                    if (av_buffersrc_add_frame_flags(buffersrc_ctx, frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+                    sw_frame->pts = in_pts; // filter needs original pts for subtitle timing
+                    if (av_buffersrc_add_frame_flags(buffersrc_ctx, sw_frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
                         filter_out = av_frame_alloc();
                         int fret = filter_out ? av_buffersink_get_frame(buffersink_ctx, filter_out) : AVERROR(ENOMEM);
                         // EAGAIN means the filter needs more frames — not an error, just use original
@@ -2609,26 +2816,57 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     int      r48stride[8] = { rgb48Stride, 0 };
                     sws_scale(sws_hdr2rgb, src_frame->data, src_frame->linesize, 0, src_frame->height,
                         r48data, r48stride);
-                    // Stage 2: per-pixel EOTF + BT.2020→BT.709 + Reinhard TM + sRGB
-                    bool   isPQ = (g_hdrTrc == AVCOL_TRC_SMPTE2084);
-                    double refW = isPQ ? 0.0203 : 0.25;
-                    for (int row = 0; row < rgb48H; row++) {
-                        const uint16_t* src16 = (const uint16_t*)(hdr_rgb48_buf + row * rgb48Stride);
-                        uint8_t* dst8         = hdr_bgr24_buf + row * rgb48W * 3;
-                        for (int x = 0; x < rgb48W; x++) {
-                            double R = src16[x*3+0] / 65535.0;
-                            double G = src16[x*3+1] / 65535.0;
-                            double B = src16[x*3+2] / 65535.0;
-                            if (isPQ) { R=pq_eotf(R); G=pq_eotf(G); B=pq_eotf(B); }
-                            else      { R=hlg_eotf(R);G=hlg_eotf(G);B=hlg_eotf(B); }
-                            double Ro = k_bt2020_to_bt709[0][0]*R+k_bt2020_to_bt709[0][1]*G+k_bt2020_to_bt709[0][2]*B;
-                            double Go = k_bt2020_to_bt709[1][0]*R+k_bt2020_to_bt709[1][1]*G+k_bt2020_to_bt709[1][2]*B;
-                            double Bo = k_bt2020_to_bt709[2][0]*R+k_bt2020_to_bt709[2][1]*G+k_bt2020_to_bt709[2][2]*B;
-                            if (Ro<0.0) Ro=0.0; if (Go<0.0) Go=0.0; if (Bo<0.0) Bo=0.0;
-                            Ro=reinhard_tm(Ro,refW); Go=reinhard_tm(Go,refW); Bo=reinhard_tm(Bo,refW);
-                            dst8[x*3+0] = srgb_pack(Bo);
-                            dst8[x*3+1] = srgb_pack(Go);
-                            dst8[x*3+2] = srgb_pack(Ro);
+                    // Stage 2: EOTF (LUT) + BT.2020→BT.709 matrix + Reinhard TM + sRGB (LUT)
+                    // Multi-threaded across rows; uses precomputed float LUTs to avoid
+                    // per-pixel pow() calls (was ~9 pow() calls/pixel at 4K = billions/sec).
+                    {
+                        const bool  bPQ   = (g_hdrTrc == AVCOL_TRC_SMPTE2084);
+                        const float refWf = bPQ ? 0.0203f : 0.25f;
+                        const uint8_t* srcBuf  = hdr_rgb48_buf;
+                        uint8_t*       dstBuf  = hdr_bgr24_buf;
+                        const int      dstStride = rgb48W * 3;
+
+                        auto process_rows = [&](int rStart, int rEnd) {
+                            for (int row = rStart; row < rEnd; row++) {
+                                const uint16_t* s = (const uint16_t*)(srcBuf + row * rgb48Stride);
+                                uint8_t*        d = dstBuf + row * dstStride;
+                                for (int x = 0; x < rgb48W; x++) {
+                                    float R = s_eotf_lut[s[x*3+0]];
+                                    float G = s_eotf_lut[s[x*3+1]];
+                                    float B = s_eotf_lut[s[x*3+2]];
+                                    float Ro = k_bt2020_to_bt709f[0][0]*R + k_bt2020_to_bt709f[0][1]*G + k_bt2020_to_bt709f[0][2]*B;
+                                    float Go = k_bt2020_to_bt709f[1][0]*R + k_bt2020_to_bt709f[1][1]*G + k_bt2020_to_bt709f[1][2]*B;
+                                    float Bo = k_bt2020_to_bt709f[2][0]*R + k_bt2020_to_bt709f[2][1]*G + k_bt2020_to_bt709f[2][2]*B;
+                                    if (Ro < 0.0f) Ro = 0.0f;
+                                    if (Go < 0.0f) Go = 0.0f;
+                                    if (Bo < 0.0f) Bo = 0.0f;
+                                    Ro = 2.0f * Ro / (refWf + Ro);
+                                    Go = 2.0f * Go / (refWf + Go);
+                                    Bo = 2.0f * Bo / (refWf + Bo);
+                                    int ir = (int)(Ro * 65535.0f + 0.5f); if (ir > 65535) ir = 65535;
+                                    int ig = (int)(Go * 65535.0f + 0.5f); if (ig > 65535) ig = 65535;
+                                    int ib = (int)(Bo * 65535.0f + 0.5f); if (ib > 65535) ib = 65535;
+                                    d[x*3+0] = s_srgb_lut16[ib];
+                                    d[x*3+1] = s_srgb_lut16[ig];
+                                    d[x*3+2] = s_srgb_lut16[ir];
+                                }
+                            }
+                        };
+
+                        static const int nWorkers = max(1, min(8, (int)std::thread::hardware_concurrency()));
+                        if (nWorkers > 1 && rgb48H >= nWorkers * 4) {
+                            int rowsEach = (rgb48H + nWorkers - 1) / nWorkers;
+                            std::vector<std::future<void>> futures;
+                            futures.reserve(nWorkers);
+                            for (int t = 0; t < nWorkers; t++) {
+                                int r0 = t * rowsEach;
+                                int r1 = min(r0 + rowsEach, rgb48H);
+                                if (r0 >= rgb48H) break;
+                                futures.push_back(std::async(std::launch::async, process_rows, r0, r1));
+                            }
+                            for (auto& f : futures) f.get();
+                        } else {
+                            process_rows(0, rgb48H);
                         }
                     }
                     // Stage 3: BGR24 → encoder YUV
@@ -2642,56 +2880,42 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 }
                 if (filter_out) av_frame_free(&filter_out);
 
-                // Alpha-blend PGS bitmap subtitle onto the scaled YUV output frame
+                // Alpha-blend PGS bitmap subtitle onto the scaled YUV output frame.
+                // Rects are already at output resolution with pre-converted YCbCr values,
+                // so this loop contains no float math or colour conversion.
                 if (use_bitmap_subs) {
                     int64_t cur_ms = (int64_t)(in_time * 1000.0);
-                    // Binary-search for the last event at or before cur_ms
                     const PgsEvent* active = nullptr;
                     for (const auto& ev : pgs_events) {
                         if (ev.pts_ms <= cur_ms) active = &ev;
                         else break;
                     }
                     if (active && !active->rects.empty()) {
-                        // Scale from subtitle coordinate space → output frame.
-                        // Use the subtitle plane's own dimensions if available; fall back to
-                        // the decoded video size (handles non-4K sources where they match).
-                        int sub_ref_w = (pgs_plane_w > 0) ? pgs_plane_w : dec_ctx->width;
-                        int sub_ref_h = (pgs_plane_h > 0) ? pgs_plane_h : dec_ctx->height;
-                        double sx = (double)enc_ctx->width  / sub_ref_w;
-                        double sy = (double)enc_ctx->height / sub_ref_h;
                         for (const auto& rect : active->rects) {
-                            for (int py = 0; py < rect.h; py++) {
-                                for (int px = 0; px < rect.w; px++) {
-                                    const uint8_t* bgra = rect.bgra.data() + ((size_t)py * rect.w + px) * 4;
-                                    uint8_t a = bgra[3];
+                            const uint8_t* yuva = rect.yuva.data();
+                            for (int dy = 0; dy < rect.h; dy++) {
+                                int fy = rect.y + dy;
+                                if (fy < 0 || fy >= enc_ctx->height) continue;
+                                uint8_t* Yrow = filt_frame->data[0] + fy * filt_frame->linesize[0];
+                                for (int dx = 0; dx < rect.w; dx++) {
+                                    int fx = rect.x + dx;
+                                    if (fx < 0 || fx >= enc_ctx->width) continue;
+                                    const uint8_t* px = yuva + ((size_t)dy * rect.w + dx) * 4;
+                                    uint8_t a = px[3];
                                     if (a == 0) continue;
-                                    int fx = (int)((rect.x + px) * sx);
-                                    int fy = (int)((rect.y + py) * sy);
-                                    if (fx < 0 || fy < 0 || fx >= enc_ctx->width || fy >= enc_ctx->height) continue;
-                                    uint8_t r = bgra[2], g = bgra[1], b = bgra[0];
                                     int inv_a = 255 - a;
-                                    // BT.601 studio-swing RGB → YCbCr
-                                    int Y  = (( 66*r + 129*g +  25*b + 128) >> 8) + 16;
-                                    int Cb = ((-38*r -  74*g + 112*b + 128) >> 8) + 128;
-                                    int Cr = ((112*r -  94*g -  18*b + 128) >> 8) + 128;
-                                    Y  = max(16, min(235, Y));
-                                    Cb = max(16, min(240, Cb));
-                                    Cr = max(16, min(240, Cr));
-                                    // Blend luma
-                                    uint8_t* Yp = filt_frame->data[0] + fy * filt_frame->linesize[0] + fx;
-                                    *Yp = (uint8_t)((Y * a + *Yp * inv_a) >> 8);
-                                    // Blend chroma at 4:2:0 sub-sample positions
+                                    Yrow[fx] = (uint8_t)((px[0] * a + Yrow[fx] * inv_a) >> 8);
                                     if ((fx & 1) == 0 && (fy & 1) == 0) {
                                         int cy = fy >> 1, cx = fx >> 1;
                                         if (enc_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
                                             uint8_t* Up = filt_frame->data[1] + cy * filt_frame->linesize[1] + cx;
                                             uint8_t* Vp = filt_frame->data[2] + cy * filt_frame->linesize[2] + cx;
-                                            *Up = (uint8_t)((Cb * a + *Up * inv_a) >> 8);
-                                            *Vp = (uint8_t)((Cr * a + *Vp * inv_a) >> 8);
+                                            *Up = (uint8_t)((px[1] * a + *Up * inv_a) >> 8);
+                                            *Vp = (uint8_t)((px[2] * a + *Vp * inv_a) >> 8);
                                         } else if (enc_ctx->pix_fmt == AV_PIX_FMT_NV12) {
                                             uint8_t* UVp = filt_frame->data[1] + cy * filt_frame->linesize[1] + cx * 2;
-                                            *UVp       = (uint8_t)((Cb * a + *UVp       * inv_a) >> 8);
-                                            *(UVp + 1) = (uint8_t)((Cr * a + *(UVp + 1) * inv_a) >> 8);
+                                            UVp[0] = (uint8_t)((px[1] * a + UVp[0] * inv_a) >> 8);
+                                            UVp[1] = (uint8_t)((px[2] * a + UVp[1] * inv_a) >> 8);
                                         }
                                     }
                                 }
@@ -2756,6 +2980,7 @@ cleanup:
     if (sws_rgb2yuv) sws_freeContext(sws_rgb2yuv);
     if (hdr_rgb48_buf) av_free(hdr_rgb48_buf);
     if (hdr_bgr24_buf) av_free(hdr_bgr24_buf);
+    if (cpu_frame) av_frame_free(&cpu_frame);
     if (frame) av_frame_free(&frame);
     if (filt_frame) av_frame_free(&filt_frame);
     if (pkt) av_packet_free(&pkt);
