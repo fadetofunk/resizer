@@ -2692,6 +2692,13 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     bool              using_hw         = false;
     int64_t           video_start_pts  = 0;
     int64_t           audio_start_pts  = 0;
+    AVCodecContext*   aDec_ctx         = nullptr;
+    AVCodecContext*   aEnc_ctx         = nullptr;
+    SwrContext*       aSwrCtx          = nullptr;
+    AVFrame*          aFrame           = nullptr;
+    AVFrame*          aEncFrame        = nullptr;
+    AVPacket*         aEncPkt          = nullptr;
+    int64_t           aOutPts          = 0;
 
     if (end_seconds <= start_seconds) { OutputDebugStringA("End time must be greater than start time.\n"); return false; }
     double segment_duration = end_seconds - start_seconds;
@@ -2716,11 +2723,7 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     // Bitrate calculation: subtract the actual audio stream bitrate so video uses the remaining budget
     {
         int64_t total_bits    = (int64_t)(target_size_mb * 8.0 * 1024.0 * 1024.0);
-        int64_t audio_bitrate = 0;
-        if (audio_in_stream) {
-            audio_bitrate = audio_in_stream->codecpar->bit_rate;
-            if (audio_bitrate <= 0) audio_bitrate = 192000; // safe fallback if container doesn't report it
-        }
+        int64_t audio_bitrate = audio_in_stream ? 192000 : 0; // always encode stereo AAC @ 192 kbps
         int64_t audio_bits  = (int64_t)(audio_bitrate * segment_duration);
         int64_t overhead    = (int64_t)(total_bits * 0.01); // ~1% for container overhead
         int64_t video_bits  = total_bits - audio_bits - overhead;
@@ -2790,10 +2793,62 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
 
     if (audio_in_stream) {
         audio_out_stream = avformat_new_stream(out_fmt_ctx, nullptr);
-        if (!audio_out_stream) { OutputDebugStringA("Could not create audio output stream. Disabling audio.\n"); audio_in_stream = nullptr; }
-        else {
-            if (avcodec_parameters_copy(audio_out_stream->codecpar, audio_in_stream->codecpar) < 0) { OutputDebugStringA("Failed to copy audio params. Disabling audio.\n"); audio_in_stream = nullptr; audio_out_stream = nullptr; }
-            else audio_out_stream->time_base = audio_in_stream->time_base;
+        bool audioOk = false;
+        if (audio_out_stream) {
+            const AVCodec* aDec = avcodec_find_decoder(audio_in_stream->codecpar->codec_id);
+            aDec_ctx = aDec ? avcodec_alloc_context3(aDec) : nullptr;
+            if (aDec_ctx && avcodec_parameters_to_context(aDec_ctx, audio_in_stream->codecpar) >= 0
+                         && avcodec_open2(aDec_ctx, aDec, nullptr) >= 0) {
+                const AVCodec* aEnc = avcodec_find_encoder(AV_CODEC_ID_AAC);
+                aEnc_ctx = aEnc ? avcodec_alloc_context3(aEnc) : nullptr;
+                if (aEnc_ctx) {
+                    int outRate = aDec_ctx->sample_rate > 48000 ? 48000 : aDec_ctx->sample_rate;
+                    aEnc_ctx->sample_fmt  = AV_SAMPLE_FMT_FLTP;
+                    aEnc_ctx->sample_rate = outRate;
+                    aEnc_ctx->bit_rate    = 192000;
+                    aEnc_ctx->time_base   = { 1, outRate };
+                    AVChannelLayout stereoLayout = AV_CHANNEL_LAYOUT_STEREO;
+                    av_channel_layout_copy(&aEnc_ctx->ch_layout, &stereoLayout);
+                    if (out_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) aEnc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                    if (avcodec_open2(aEnc_ctx, aEnc, nullptr) >= 0
+                     && avcodec_parameters_from_context(audio_out_stream->codecpar, aEnc_ctx) >= 0) {
+                        audio_out_stream->time_base = aEnc_ctx->time_base;
+                        aSwrCtx = swr_alloc();
+                        if (aSwrCtx) {
+                            av_opt_set_chlayout  (aSwrCtx, "in_chlayout",    &aDec_ctx->ch_layout, 0);
+                            av_opt_set_int       (aSwrCtx, "in_sample_rate",  aDec_ctx->sample_rate, 0);
+                            av_opt_set_sample_fmt(aSwrCtx, "in_sample_fmt",   aDec_ctx->sample_fmt,  0);
+                            av_opt_set_chlayout  (aSwrCtx, "out_chlayout",   &stereoLayout,         0);
+                            av_opt_set_int       (aSwrCtx, "out_sample_rate", outRate,               0);
+                            av_opt_set_sample_fmt(aSwrCtx, "out_sample_fmt",  AV_SAMPLE_FMT_FLTP,   0);
+                            if (swr_init(aSwrCtx) >= 0) {
+                                aFrame    = av_frame_alloc();
+                                aEncFrame = av_frame_alloc();
+                                aEncPkt   = av_packet_alloc();
+                                if (aEncFrame) {
+                                    aEncFrame->nb_samples  = aEnc_ctx->frame_size;
+                                    aEncFrame->format      = AV_SAMPLE_FMT_FLTP;
+                                    aEncFrame->sample_rate = outRate;
+                                    av_channel_layout_copy(&aEncFrame->ch_layout, &aEnc_ctx->ch_layout);
+                                    av_frame_get_buffer(aEncFrame, 0);
+                                }
+                                audioOk = aFrame && aEncFrame && aEncPkt;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!audioOk) {
+            OutputDebugStringA("Audio encode setup failed; output will have no audio.\n");
+            if (aSwrCtx)   { swr_free(&aSwrCtx);              aSwrCtx   = nullptr; }
+            if (aDec_ctx)  { avcodec_free_context(&aDec_ctx); aDec_ctx  = nullptr; }
+            if (aEnc_ctx)  { avcodec_free_context(&aEnc_ctx); aEnc_ctx  = nullptr; }
+            if (aFrame)    { av_frame_free(&aFrame);           aFrame    = nullptr; }
+            if (aEncFrame) { av_frame_free(&aEncFrame);        aEncFrame = nullptr; }
+            if (aEncPkt)   { av_packet_free(&aEncPkt);         aEncPkt   = nullptr; }
+            audio_in_stream  = nullptr;
+            audio_out_stream = nullptr;
         }
     }
 
@@ -3264,26 +3319,37 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
             }
         }
 
-        else if (audio_in_stream && pkt->stream_index == audioStreamIndex) {
+        else if (audio_in_stream && pkt->stream_index == audioStreamIndex
+                 && aDec_ctx && aEnc_ctx && aSwrCtx) {
             AVRational in_tb = audio_in_stream->time_base;
-            AVRational out_tb = audio_out_stream->time_base;
-            // Normalize missing PTS/DTS
-            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE) pkt->pts = pkt->dts;
-            if (pkt->dts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) pkt->dts = pkt->pts;
-
-            int64_t aud_in_pts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+            int64_t aud_in_pts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts
+                                : (pkt->dts != AV_NOPTS_VALUE) ? pkt->dts : 0;
             double aud_time = aud_in_pts * av_q2d(in_tb);
             if (aud_time < start_seconds || aud_time > end_seconds) { av_packet_unref(pkt); continue; }
 
-            // Shift audio PTS/DTS so segment starts at t=0 in the audio TB
-            if (pkt->pts != AV_NOPTS_VALUE) { pkt->pts -= audio_start_pts; if (pkt->pts < 0) pkt->pts = 0; }
-            if (pkt->dts != AV_NOPTS_VALUE) { pkt->dts -= audio_start_pts; if (pkt->dts < 0) pkt->dts = 0; }
+            if (avcodec_send_packet(aDec_ctx, pkt) >= 0) {
+                while (avcodec_receive_frame(aDec_ctx, aFrame) == 0) {
+                    // Feed decoded samples into swr (no output pull yet)
+                    swr_convert(aSwrCtx, nullptr, 0,
+                                (const uint8_t**)aFrame->extended_data, aFrame->nb_samples);
+                    av_frame_unref(aFrame);
 
-            // Rescale into output TB and write
-            av_packet_rescale_ts(pkt, in_tb, out_tb);
-            pkt->stream_index = audio_out_stream->index;
-            pkt->pos = -1;
-            av_interleaved_write_frame(out_fmt_ctx, pkt);
+                    // Pull complete AAC frames (frame_size = 1024 samples)
+                    while (swr_get_out_samples(aSwrCtx, 0) >= aEnc_ctx->frame_size) {
+                        av_frame_make_writable(aEncFrame);
+                        swr_convert(aSwrCtx, aEncFrame->data, aEnc_ctx->frame_size, nullptr, 0);
+                        aEncFrame->pts = aOutPts;
+                        aOutPts += aEnc_ctx->frame_size;
+                        avcodec_send_frame(aEnc_ctx, aEncFrame);
+                        while (avcodec_receive_packet(aEnc_ctx, aEncPkt) == 0) {
+                            aEncPkt->stream_index = audio_out_stream->index;
+                            av_packet_rescale_ts(aEncPkt, aEnc_ctx->time_base, audio_out_stream->time_base);
+                            av_interleaved_write_frame(out_fmt_ctx, aEncPkt);
+                            av_packet_unref(aEncPkt);
+                        }
+                    }
+                }
+            }
         }
 
         av_packet_unref(pkt);
@@ -3298,6 +3364,32 @@ flush_encoder:
         av_packet_unref(enc_pkt);
     }
     av_packet_unref(enc_pkt);
+
+    // Flush audio: drain swr remainder (partial frame), then flush encoder
+    if (aEnc_ctx && aSwrCtx && audio_out_stream && aEncFrame && aEncPkt) {
+        int remaining = swr_get_out_samples(aSwrCtx, 0);
+        if (remaining > 0) {
+            av_frame_make_writable(aEncFrame);
+            int got = swr_convert(aSwrCtx, aEncFrame->data, aEnc_ctx->frame_size, nullptr, 0);
+            // zero-pad the rest of the frame so the encoder sees a complete frame
+            if (got < aEnc_ctx->frame_size) {
+                int ch = aEncFrame->ch_layout.nb_channels;
+                for (int c = 0; c < ch; c++)
+                    memset(aEncFrame->data[c] + got * sizeof(float), 0,
+                           (aEnc_ctx->frame_size - got) * sizeof(float));
+            }
+            aEncFrame->pts = aOutPts;
+            aOutPts += aEnc_ctx->frame_size;
+            avcodec_send_frame(aEnc_ctx, aEncFrame);
+        }
+        avcodec_send_frame(aEnc_ctx, nullptr);
+        while (avcodec_receive_packet(aEnc_ctx, aEncPkt) == 0) {
+            aEncPkt->stream_index = audio_out_stream->index;
+            av_packet_rescale_ts(aEncPkt, aEnc_ctx->time_base, audio_out_stream->time_base);
+            av_interleaved_write_frame(out_fmt_ctx, aEncPkt);
+            av_packet_unref(aEncPkt);
+        }
+    }
 
     av_write_trailer(out_fmt_ctx);
     success = true;
@@ -3314,8 +3406,14 @@ cleanup:
     if (filt_frame) av_frame_free(&filt_frame);
     if (pkt) av_packet_free(&pkt);
     if (enc_pkt) av_packet_free(&enc_pkt);
-    if (dec_ctx) avcodec_free_context(&dec_ctx);
-    if (enc_ctx) avcodec_free_context(&enc_ctx);
+    if (dec_ctx)  avcodec_free_context(&dec_ctx);
+    if (enc_ctx)  avcodec_free_context(&enc_ctx);
+    if (aDec_ctx) avcodec_free_context(&aDec_ctx);
+    if (aEnc_ctx) avcodec_free_context(&aEnc_ctx);
+    if (aSwrCtx)  swr_free(&aSwrCtx);
+    if (aFrame)    av_frame_free(&aFrame);
+    if (aEncFrame) av_frame_free(&aEncFrame);
+    if (aEncPkt)   av_packet_free(&aEncPkt);
     if (in_fmt_ctx) avformat_close_input(&in_fmt_ctx);
     if (out_fmt_ctx) {
         if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_fmt_ctx->pb);
