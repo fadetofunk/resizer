@@ -6,6 +6,8 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <strsafe.h>
 #include <string>
 #include <vector>
@@ -17,6 +19,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #include <uxtheme.h>
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "ole32.lib")
 #include <windowsx.h>
 #include <io.h>
 #include <fcntl.h>
@@ -78,6 +81,13 @@ extern "C" {
 #define IDC_SUBS_STATIC           2018
 #define IDC_SUBS_DROPDOWN         2019
 #define IDC_GRP_MEDIA             2020
+#define IDC_GRP_SAVELOC           2021
+#define IDC_SAVE_SAME_RADIO       2022
+#define IDC_SAVE_CUSTOM_RADIO     2023
+#define IDC_SAVE_PATH_EDIT        2024
+#define IDC_SAVE_BROWSE_BTN       2025
+#define IDC_GRP_COLOR             2026
+#define IDC_COLOR_DROP            2027
 
 // ------------------------------ Globals ------------------------------
 #define WM_APP_FRAME_READY (WM_APP + 1)
@@ -136,6 +146,23 @@ static HWND     g_hSubsDrop      = nullptr;  // subtitles combo box
 static ULONG_PTR g_gdiplusToken  = 0;
 static HWND      g_hTooltip      = nullptr;
 
+// Save Location
+static HWND     g_hGrpSaveLoc      = nullptr;
+static HWND     g_hSaveSameRadio   = nullptr;
+static HWND     g_hSaveCustomRadio = nullptr;
+static HWND     g_hSavePathEdit    = nullptr;
+static HWND     g_hSaveBrowseBtn   = nullptr;
+static wchar_t  g_saveFolder[MAX_PATH] = { 0 };
+static bool     g_saveCustom       = false;
+
+// Color Space / HDR
+static HWND     g_hGrpColor        = nullptr;
+static HWND     g_hColorDrop       = nullptr;
+static bool     g_isHdr            = false;
+static int      g_hdrTrc           = 0;   // AVColorTransferCharacteristic of source
+static uint8_t  g_hdrDisplay8Lut[256] = {};
+static bool     g_hdrLutValid      = false;
+
 // ------------------------------ Theme ------------------------------
 struct AppTheme {
     COLORREF bk;           // window / panel background
@@ -182,10 +209,11 @@ bool GetVideoInfo(const char* filepath, int& width, int& height, double& duratio
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
     int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds,
-    int audio_stream_index = -1, int subtitle_stream_index = -1);
+    int audio_stream_index = -1, int subtitle_stream_index = -1, bool convert_hdr_to_sdr = false);
 
 // Audio/subtitle track enumeration
 static void PopulateAudioAndSubsDropdowns(const char* filepath);
+static void DetectHdr(const char* filepath);
 
 // Playback helpers
 unsigned __stdcall PlaybackThreadProc(void*);
@@ -202,24 +230,29 @@ void SetMarkOutFromCurrent(HWND hwnd);
 
 // ------------------------------ UI Layout ------------------------------
 void HandleResize(HWND hwnd, int clientW, int clientH) {
-    const int M  = 10;  // outer margin
-    const int P  = 8;   // inner padding inside group boxes
-    const int GH = 22;  // group box header height
-    const int RH = 22;  // standard row height
+    const int M      = 10;  // outer margin
+    const int P      = 8;   // inner padding inside group boxes
+    const int GH     = 22;  // group box header height
+    const int RH     = 22;  // standard row height
+    const int totalW = clientW - M * 2;
+    const int colGap = 6;
+    const int lColW  = (totalW - colGap) * 3 / 5;   // ~60% — left column groups
+    const int rColW  = totalW - colGap - lColW;       // ~40% — right column groups
 
     int y = M;
 
     // Info bar – always at top, full width
-    MoveWindow(g_hInfoStatic, M, y, clientW - M * 2, RH, TRUE);
+    MoveWindow(g_hInfoStatic, M, y, totalW, RH, TRUE);
     y += RH + M;
 
-    // === Output Settings (3 rows: Target MB, Suffix, Resolution) ===
+    // === Output Settings (left) + Save Location (right) ===
     int settingsH = GH + P + RH + 5 + RH + 5 + RH + P;
-    MoveWindow(g_hGrpSettings, M, y, clientW - M * 2, settingsH, TRUE);
+    MoveWindow(g_hGrpSettings, M,                  y, lColW, settingsH, TRUE);
+    MoveWindow(g_hGrpSaveLoc,  M + lColW + colGap, y, rColW, settingsH, TRUE);
     {
         int ix = M + P, iy = y + GH;
         int lw = 130;
-        int ew = max(50, clientW - M * 2 - P * 2 - lw - 6);
+        int ew = max(40, lColW - P * 2 - lw - 6);
         MoveWindow(g_hSizeStatic,   ix,          iy, lw, RH, TRUE);
         MoveWindow(g_hSizeEdit,     ix + lw + 6, iy, ew, RH, TRUE);
         iy += RH + 5;
@@ -229,23 +262,34 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         MoveWindow(g_hResStatic,    ix,          iy, lw, RH, TRUE);
         MoveWindow(g_hResDrop,      ix + lw + 6, iy, ew, RH, TRUE);
     }
+    {
+        int sx     = M + lColW + colGap + P;
+        int iy     = y + GH;
+        int innerW = rColW - P * 2;
+        MoveWindow(g_hSaveSameRadio,   sx, iy, innerW, RH, TRUE);
+        iy += RH + 5;
+        MoveWindow(g_hSaveCustomRadio, sx, iy, innerW, RH, TRUE);
+        iy += RH + 5;
+        int browseW = 70;
+        int editW   = max(40, innerW - browseW - 4);
+        MoveWindow(g_hSavePathEdit,  sx,             iy, editW,   RH, TRUE);
+        MoveWindow(g_hSaveBrowseBtn, sx + editW + 4, iy, browseW, RH, TRUE);
+    }
     y += settingsH + M;
 
-    // === Range (radios + start/end, full width) ===
+    // === Range (left) + Color Space (right) ===
     int rangeH = GH + P + RH + P;
-    MoveWindow(g_hGrpRange, M, y, clientW - M * 2, rangeH, TRUE);
+    MoveWindow(g_hGrpRange, M,                  y, lColW, rangeH, TRUE);
+    MoveWindow(g_hGrpColor, M + lColW + colGap, y, rColW, rangeH, TRUE);
     {
-        int ix     = M + P, iy = y + GH;
-        int innerW = clientW - M * 2 - P * 2;
-        int rightIx = ix + innerW;
-
+        int ix      = M + P, iy = y + GH;
+        int rightIx = M + lColW - P;
         const int radioW1 = 105, radioW2 = 120, gapR = 10;
         MoveWindow(g_hRangeFullRadio,   ix,                  iy, radioW1, RH, TRUE);
         MoveWindow(g_hRangeCustomRadio, ix + radioW1 + gapR, iy, radioW2, RH, TRUE);
 
-        int midLeft  = ix + radioW1 + gapR + radioW2 + 12;
-        int midRight = rightIx;
-        int midW     = midRight - midLeft;
+        int midLeft = ix + radioW1 + gapR + radioW2 + 12;
+        int midW    = rightIx - midLeft;
         const int labelW = 90;
         int editW = max(40, (midW - labelW * 2 - 8) / 2);
         MoveWindow(g_hStartStatic, midLeft,                          iy, labelW, RH, TRUE);
@@ -253,15 +297,21 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         MoveWindow(g_hEndStatic,   midLeft + labelW + editW + 8,     iy, labelW, RH, TRUE);
         MoveWindow(g_hEndEdit,     midLeft + labelW * 2 + editW + 8, iy, editW,  RH, TRUE);
     }
+    {
+        int cx     = M + lColW + colGap + P;
+        int iy     = y + GH;
+        int innerW = rColW - P * 2;
+        MoveWindow(g_hColorDrop, cx, iy, innerW, 120, TRUE);
+    }
     y += rangeH + M;
 
     // === Audio & Subtitles (2 rows) ===
     int mediaH = GH + P + RH + 5 + RH + P;
-    MoveWindow(g_hGrpMedia, M, y, clientW - M * 2, mediaH, TRUE);
+    MoveWindow(g_hGrpMedia, M, y, totalW, mediaH, TRUE);
     {
         int ix = M + P, iy = y + GH;
         int lw = 130;
-        int ew = max(50, clientW - M * 2 - P * 2 - lw - 6);
+        int ew = max(50, totalW - P * 2 - lw - 6);
         MoveWindow(g_hAudioStatic, ix,          iy, lw,  RH,  TRUE);
         MoveWindow(g_hAudioDrop,   ix + lw + 6, iy, ew,  120, TRUE);
         iy += RH + 5;
@@ -273,10 +323,10 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     // === Player ===
     const int btnW = 90, btnH = 28, seekH = 72;
     int playerH = GH + P + btnH + 6 + seekH + P;
-    MoveWindow(g_hGrpPlayer, M, y, clientW - M * 2, playerH, TRUE);
+    MoveWindow(g_hGrpPlayer, M, y, totalW, playerH, TRUE);
     {
         int ix    = M + P, iy = y + GH;
-        int avail = clientW - M * 2 - P * 2;
+        int avail = totalW - P * 2;
         MoveWindow(g_hBtnPlayPause, ix,                       iy, btnW, btnH, TRUE);
         MoveWindow(g_hBtnBack,      ix + btnW + 6,            iy, btnW, btnH, TRUE);
         MoveWindow(g_hBtnFwd,       ix + (btnW + 6) * 2,      iy, btnW, btnH, TRUE);
@@ -288,7 +338,7 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     y += playerH + M;
 
     // === Start Processing button — very bottom ===
-    MoveWindow(g_hStartButton, M, y, clientW - M * 2, 32, TRUE);
+    MoveWindow(g_hStartButton, M, y, totalW, 32, TRUE);
 
     // frame preview fills remaining client area below the start button
     InvalidateRect(hwnd, nullptr, TRUE);
@@ -296,6 +346,8 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
 
 // ------------------------------ App Entry ------------------------------
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
     Gdiplus::GdiplusStartupInput gdiplusInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
 
@@ -351,6 +403,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     DeleteCriticalSection(&g_csState);
     if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
+    CoUninitialize();
     return (int)msg.wParam;
 }
 
@@ -417,12 +470,14 @@ static void ApplyTheme(HWND hwnd) {
         if (g_hGrpResolution) SetWindowTheme(g_hGrpResolution,  ctrlTheme, nullptr);
         if (g_hGrpPlayer)     SetWindowTheme(g_hGrpPlayer,      ctrlTheme, nullptr);
         if (g_hGrpMedia)      SetWindowTheme(g_hGrpMedia,       ctrlTheme, nullptr);
+        if (g_hGrpSaveLoc)    SetWindowTheme(g_hGrpSaveLoc,     ctrlTheme, nullptr);
 
         // Edit controls — border + scrollbar rendered dark
-        if (g_hSizeEdit)   SetWindowTheme(g_hSizeEdit,   editTheme, nullptr);
-        if (g_hSuffixEdit) SetWindowTheme(g_hSuffixEdit, editTheme, nullptr);
-        if (g_hStartEdit)  SetWindowTheme(g_hStartEdit,  editTheme, nullptr);
-        if (g_hEndEdit)    SetWindowTheme(g_hEndEdit,    editTheme, nullptr);
+        if (g_hSizeEdit)      SetWindowTheme(g_hSizeEdit,      editTheme, nullptr);
+        if (g_hSuffixEdit)    SetWindowTheme(g_hSuffixEdit,    editTheme, nullptr);
+        if (g_hStartEdit)     SetWindowTheme(g_hStartEdit,     editTheme, nullptr);
+        if (g_hEndEdit)       SetWindowTheme(g_hEndEdit,       editTheme, nullptr);
+        if (g_hSavePathEdit)  SetWindowTheme(g_hSavePathEdit,  editTheme, nullptr);
 
         // Combo boxes
         if (g_hAudioDrop) SetWindowTheme(g_hAudioDrop, editTheme, nullptr);
@@ -431,6 +486,10 @@ static void ApplyTheme(HWND hwnd) {
         // Radio buttons — dot, circle and text rendered in correct mode
         if (g_hRangeFullRadio)   SetWindowTheme(g_hRangeFullRadio,   ctrlTheme, nullptr);
         if (g_hRangeCustomRadio) SetWindowTheme(g_hRangeCustomRadio, ctrlTheme, nullptr);
+        if (g_hSaveSameRadio)    SetWindowTheme(g_hSaveSameRadio,    ctrlTheme, nullptr);
+        if (g_hSaveCustomRadio)  SetWindowTheme(g_hSaveCustomRadio,  ctrlTheme, nullptr);
+        if (g_hGrpColor)         SetWindowTheme(g_hGrpColor,         ctrlTheme, nullptr);
+        if (g_hColorDrop)        SetWindowTheme(g_hColorDrop,        editTheme, nullptr);
     }
 
     // Repaint everything
@@ -621,6 +680,92 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
     }
 }
 
+// ------------------------------ Persistent Settings ------------------------------
+static const wchar_t* kRegKey = L"Software\\Resizer";
+
+static void LoadSettings() {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegKey, 0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return;
+
+    DWORD type, sz;
+
+    // Target size
+    wchar_t sizeBuf[64] = {};
+    sz = sizeof(sizeBuf);
+    if (RegQueryValueExW(hk, L"TargetSizeMB", nullptr, &type,
+                         (BYTE*)sizeBuf, &sz) == ERROR_SUCCESS && type == REG_SZ && sizeBuf[0])
+        SetWindowTextW(g_hSizeEdit, sizeBuf);
+
+    // Suffix
+    wchar_t sfxBuf[256] = {};
+    sz = sizeof(sfxBuf);
+    if (RegQueryValueExW(hk, L"Suffix", nullptr, &type,
+                         (BYTE*)sfxBuf, &sz) == ERROR_SUCCESS && type == REG_SZ)
+        SetWindowTextW(g_hSuffixEdit, sfxBuf);
+
+    // Custom save folder flag
+    DWORD custom = 0;
+    sz = sizeof(custom);
+    if (RegQueryValueExW(hk, L"SaveCustom", nullptr, &type,
+                         (BYTE*)&custom, &sz) == ERROR_SUCCESS && type == REG_DWORD)
+        g_saveCustom = (custom != 0);
+
+    // Custom folder path
+    wchar_t folder[MAX_PATH] = {};
+    sz = sizeof(folder);
+    if (RegQueryValueExW(hk, L"SaveFolder", nullptr, &type,
+                         (BYTE*)folder, &sz) == ERROR_SUCCESS && type == REG_SZ)
+        wcscpy_s(g_saveFolder, folder);
+
+    RegCloseKey(hk);
+
+    // Apply to UI
+    if (g_saveCustom && g_saveFolder[0]) {
+        SendMessage(g_hSaveSameRadio,   BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessage(g_hSaveCustomRadio, BM_SETCHECK, BST_CHECKED,   0);
+        SetWindowTextW(g_hSavePathEdit, g_saveFolder);
+        EnableWindow(g_hSavePathEdit,   TRUE);
+        EnableWindow(g_hSaveBrowseBtn,  TRUE);
+    } else {
+        g_saveCustom = false;
+        SendMessage(g_hSaveSameRadio,   BM_SETCHECK, BST_CHECKED,   0);
+        SendMessage(g_hSaveCustomRadio, BM_SETCHECK, BST_UNCHECKED, 0);
+        EnableWindow(g_hSavePathEdit,   FALSE);
+        EnableWindow(g_hSaveBrowseBtn,  FALSE);
+    }
+}
+
+static void SaveSettings() {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
+        return;
+
+    // Target size
+    wchar_t sizeBuf[64] = {};
+    GetWindowTextW(g_hSizeEdit, sizeBuf, ARRAYSIZE(sizeBuf));
+    RegSetValueExW(hk, L"TargetSizeMB", 0, REG_SZ,
+                   (const BYTE*)sizeBuf, (DWORD)((wcslen(sizeBuf) + 1) * sizeof(wchar_t)));
+
+    // Suffix
+    wchar_t sfxBuf[256] = {};
+    GetWindowTextW(g_hSuffixEdit, sfxBuf, ARRAYSIZE(sfxBuf));
+    RegSetValueExW(hk, L"Suffix", 0, REG_SZ,
+                   (const BYTE*)sfxBuf, (DWORD)((wcslen(sfxBuf) + 1) * sizeof(wchar_t)));
+
+    // Custom flag
+    DWORD custom = g_saveCustom ? 1 : 0;
+    RegSetValueExW(hk, L"SaveCustom", 0, REG_DWORD, (const BYTE*)&custom, sizeof(custom));
+
+    // Folder path
+    RegSetValueExW(hk, L"SaveFolder", 0, REG_SZ,
+                   (const BYTE*)g_saveFolder,
+                   (DWORD)((wcslen(g_saveFolder) + 1) * sizeof(wchar_t)));
+
+    RegCloseKey(hk);
+}
+
 // ------------------------------ Window Proc ------------------------------
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -654,9 +799,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hGrpMedia = CreateWindowEx(0, L"BUTTON", L"Audio & Subtitles",
             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_MEDIA, GetModuleHandle(nullptr), nullptr);
+        g_hGrpSaveLoc = CreateWindowEx(0, L"BUTTON", L"Save Location",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_SAVELOC, GetModuleHandle(nullptr), nullptr);
         g_hGrpPlayer = CreateWindowEx(0, L"BUTTON", L"Player",
             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
             0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_PLAYER, GetModuleHandle(nullptr), nullptr);
+        g_hGrpColor = CreateWindowEx(0, L"BUTTON", L"Color Space",
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_GRP_COLOR, GetModuleHandle(nullptr), nullptr);
 
         g_hInfoStatic = CreateWindowEx(0, L"STATIC", L"Drop a video file onto this window",
             WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 10, 10, 240, 20, hwnd,
@@ -753,6 +904,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE,
             10, 285, 600, 72, hwnd, (HMENU)IDC_SEEKBAR, GetModuleHandle(nullptr), nullptr);
 
+        g_hSaveSameRadio = CreateWindowEx(0, L"BUTTON", L"Same folder as source",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SAVE_SAME_RADIO, GetModuleHandle(nullptr), nullptr);
+        g_hSaveCustomRadio = CreateWindowEx(0, L"BUTTON", L"Custom folder",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SAVE_CUSTOM_RADIO, GetModuleHandle(nullptr), nullptr);
+        g_hSavePathEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SAVE_PATH_EDIT, GetModuleHandle(nullptr), nullptr);
+        g_hSaveBrowseBtn = CreateWindowEx(0, L"BUTTON", L"Browse\u2026",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SAVE_BROWSE_BTN, GetModuleHandle(nullptr), nullptr);
+        SendMessage(g_hSaveSameRadio, BM_SETCHECK, BST_CHECKED, 0);
+
+        g_hColorDrop = CreateWindowEx(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 0, 120, hwnd, (HMENU)IDC_COLOR_DROP, GetModuleHandle(nullptr), nullptr);
+
         // Apply UI font to every control
         if (g_hFont) {
             auto applyFont = [&](HWND h) { SendMessage(h, WM_SETFONT, (WPARAM)g_hFont, FALSE); };
@@ -774,6 +943,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             applyLabelFont(g_hSubsStatic);     applyFont(g_hSubsDrop);
             applyFont(g_hBtnPlayPause);   applyFont(g_hBtnBack);
             applyFont(g_hBtnFwd);         applyFont(g_hBtnMarkIn);   applyFont(g_hBtnMarkOut);
+            applyFont(g_hGrpSaveLoc);
+            applyLabelFont(g_hSaveSameRadio);  applyLabelFont(g_hSaveCustomRadio);
+            applyFont(g_hSavePathEdit);        applyFont(g_hSaveBrowseBtn);
+            applyFont(g_hGrpColor);            applyFont(g_hColorDrop);
         }
 
         // Create tooltip control and register each button
@@ -796,12 +969,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         addTip(g_hStartButton,  L"Transcode video to the target file size");
         addTip(g_hResDrop,      L"Output resolution — click to change");
         addTip(g_hAudioDrop,    L"Select which audio track to include in the output");
-        addTip(g_hSubsDrop,     L"Select a subtitle track to burn into the video, or None to skip");
-        addTip(g_hBtnPlayPause, L"Play / Pause  [Space]");
+        addTip(g_hSubsDrop,      L"Select a subtitle track to burn into the video, or None to skip");
+        addTip(g_hSaveBrowseBtn, L"Choose the folder where the output file will be saved");
+        addTip(g_hColorDrop,     L"Color space — for HDR content, choose to preserve HDR or convert to SDR on export");
+        addTip(g_hBtnPlayPause,  L"Play / Pause  [Space]");
         addTip(g_hBtnBack,      L"Step back one frame  [\u2190]");
         addTip(g_hBtnFwd,       L"Step forward one frame  [\u2192]");
         addTip(g_hBtnMarkIn,    L"Set clip start to current position  [I]");
         addTip(g_hBtnMarkOut,   L"Set clip end to current position  [O]");
+
+        // Restore saved settings from the registry
+        LoadSettings();
 
         break;
     }
@@ -918,6 +1096,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(g_hSubsDrop,    TRUE);
                 PopulateAudioAndSubsDropdowns(g_inputPath);
 
+                DetectHdr(g_inputPath);
+                SendMessage(g_hColorDrop, CB_RESETCONTENT, 0, 0);
+                if (g_isHdr) {
+                    SendMessageW(g_hColorDrop, CB_ADDSTRING, 0, (LPARAM)L"HDR (preserve)");
+                    SendMessageW(g_hColorDrop, CB_ADDSTRING, 0, (LPARAM)L"Convert to SDR");
+                    SendMessage(g_hColorDrop, CB_SETCURSEL, 0, 0);
+                    EnableWindow(g_hColorDrop, TRUE);
+                } else {
+                    SendMessageW(g_hColorDrop, CB_ADDSTRING, 0, (LPARAM)L"SDR");
+                    SendMessage(g_hColorDrop, CB_SETCURSEL, 0, 0);
+                    EnableWindow(g_hColorDrop, FALSE);
+                }
+
                 EnableWindow(g_hStartButton, TRUE);
 
                 wchar_t startBuf[32], endBuf[32];
@@ -1031,6 +1222,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             EnableWindow(g_hEndStatic, TRUE);
             EnableWindow(g_hEndEdit, TRUE);
         }
+        else if (id == IDC_SAVE_SAME_RADIO) {
+            g_saveCustom = false;
+            EnableWindow(g_hSavePathEdit,  FALSE);
+            EnableWindow(g_hSaveBrowseBtn, FALSE);
+        }
+        else if (id == IDC_SAVE_CUSTOM_RADIO) {
+            g_saveCustom = true;
+            EnableWindow(g_hSavePathEdit,  TRUE);
+            EnableWindow(g_hSaveBrowseBtn, TRUE);
+        }
+        else if (id == IDC_SAVE_BROWSE_BTN) {
+            IFileOpenDialog* pDlg = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                           CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pDlg)))) {
+                DWORD dwOpts = 0;
+                pDlg->GetOptions(&dwOpts);
+                pDlg->SetOptions(dwOpts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+                pDlg->SetTitle(L"Select save folder");
+                if (g_saveFolder[0]) {
+                    IShellItem* pFolder = nullptr;
+                    if (SUCCEEDED(SHCreateItemFromParsingName(g_saveFolder, nullptr,
+                                                               IID_PPV_ARGS(&pFolder)))) {
+                        pDlg->SetFolder(pFolder);
+                        pFolder->Release();
+                    }
+                }
+                if (SUCCEEDED(pDlg->Show(hwnd))) {
+                    IShellItem* pResult = nullptr;
+                    if (SUCCEEDED(pDlg->GetResult(&pResult))) {
+                        PWSTR pPath = nullptr;
+                        if (SUCCEEDED(pResult->GetDisplayName(SIGDN_FILESYSPATH, &pPath))) {
+                            wcscpy_s(g_saveFolder, pPath);
+                            SetWindowTextW(g_hSavePathEdit, g_saveFolder);
+                            CoTaskMemFree(pPath);
+                        }
+                        pResult->Release();
+                    }
+                }
+                pDlg->Release();
+            }
+        }
 
         if (id == IDC_START_BUTTON) {
             wchar_t sizeBuf[32] = { 0 };
@@ -1073,15 +1305,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 char drive[_MAX_DRIVE], dir[_MAX_DIR], fname[_MAX_FNAME], ext[_MAX_EXT];
                 _splitpath_s(g_inputPath, drive, _MAX_DRIVE, dir, _MAX_DIR, fname, _MAX_FNAME, ext, _MAX_EXT);
-                char baseName[MAX_PATH];
-                StringCchPrintfA(baseName, MAX_PATH, "%s_%s%s", fname, suffixA, ext);
+
+                // Determine output directory
+                char outDir[MAX_PATH] = {};
+                if (g_saveCustom && g_saveFolder[0]) {
+                    WideCharToMultiByte(CP_ACP, 0, g_saveFolder, -1, outDir, MAX_PATH, nullptr, nullptr);
+                    size_t dlen = strlen(outDir);
+                    if (dlen > 0 && outDir[dlen - 1] != '\\' && outDir[dlen - 1] != '/')
+                        strcat_s(outDir, "\\");
+                } else {
+                    StringCchPrintfA(outDir, MAX_PATH, "%s%s", drive, dir);
+                }
+
                 char candidate[MAX_PATH];
-                _makepath_s(candidate, MAX_PATH, drive, dir, baseName, nullptr);
+                StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s%s", outDir, fname, suffixA, ext);
                 if (_access(candidate, 0) == 0) {
                     for (int i = 1;; i++) {
-                        char numbered[MAX_PATH];
-                        StringCchPrintfA(numbered, MAX_PATH, "%s_%s-%d%s", fname, suffixA, i, ext);
-                        _makepath_s(candidate, MAX_PATH, drive, dir, numbered, nullptr);
+                        StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s-%d%s",
+                                         outDir, fname, suffixA, i, ext);
                         if (_access(candidate, 0) != 0) break;
                     }
                 }
@@ -1097,9 +1338,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (s != CB_ERR) selSubs  = (int)(INT_PTR)SendMessage(g_hSubsDrop,  CB_GETITEMDATA, s, 0);
             }
 
+            bool convertHdrToSdr = false;
+            if (g_isHdr) {
+                LRESULT colorSel = SendMessage(g_hColorDrop, CB_GETCURSEL, 0, 0);
+                convertHdrToSdr = (colorSel == 1);  // index 1 = "Convert to SDR"
+            }
+
             EnableWindow(g_hStartButton, FALSE);
             bool ok = TranscodeWithSizeAndScale(g_inputPath, outPath, targetSizeMB, scaleFactor,
-                g_vidWidth, g_vidHeight, startSecs, endSecs, selAudio, selSubs);
+                g_vidWidth, g_vidHeight, startSecs, endSecs, selAudio, selSubs, convertHdrToSdr);
             if (ok) {
                 std::string msg = "Successfully created:\n"; msg += outPath;
                 MessageBoxA(hwnd, msg.c_str(), "Success", MB_ICONINFORMATION);
@@ -1192,6 +1439,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        SaveSettings();
         StopPlayback();
         g_thumbThreadStop = true;
         if (g_thumbThread) {
@@ -1321,6 +1569,89 @@ bool GetVideoInfo(const char* filepath, int& width, int& height, double& duratio
     return true;
 }
 
+// ------------------------------ HDR Helpers (shared by preview, playback & encode) ------
+// Guard for older FFmpeg builds that don't define SWS_CS_BT2020
+#ifndef SWS_CS_BT2020
+#define SWS_CS_BT2020 9
+#endif
+
+// PQ (SMPTE ST 2084) EOTF: normalised [0,1] → linear light [0,1] (1.0 = 10 000 nits)
+static double pq_eotf(double N) {
+    if (N <= 0.0) return 0.0;
+    const double m1 = 0.1593017578125, m2 = 78.84375;
+    const double c1 = 0.8359375,       c2 = 18.8515625, c3 = 18.6875;
+    double p   = pow(N, 1.0 / m2);
+    double num = p - c1; if (num < 0.0) num = 0.0;
+    double den = c2 - c3 * p;
+    return den > 0.0 ? pow(num / den, 1.0 / m1) : 0.0;
+}
+// HLG (ARIB STD-B67) OETF inverse: normalised [0,1] → scene-linear [0,1]
+static double hlg_eotf(double E) {
+    if (E < 0.0) return 0.0;
+    if (E <= 0.5) return (E * E) / 3.0;
+    const double a = 0.17883277, b = 0.28466892, c = 0.55991073;
+    return (exp((E - c) / a) + b) / 12.0;
+}
+// Reinhard tone mapping in linear light; white = reference white level.
+// Maps v=0→0, v=white→1.0, v>white→clamped. Uses 2v/(white+v) so the
+// slope at the origin is 2/white (linear), avoiding the quadratic collapse
+// of the "extended" formula when v << white (common with PQ linear values).
+static inline double reinhard_tm(double v, double white) {
+    return 2.0 * v / (white + v);
+}
+// sRGB OETF: linear [0,1] → gamma-encoded uint8
+static inline uint8_t srgb_pack(double v) {
+    double g = (v <= 0.0031308) ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+    int i = (int)(g * 255.0 + 0.5);
+    return (uint8_t)(i < 0 ? 0 : i > 255 ? 255 : i);
+}
+// BT.2020 → BT.709 primaries matrix (linear RGB)
+static const double k_bt2020_to_bt709[3][3] = {
+    { 1.6605, -0.5876, -0.0728 },
+    {-0.1246,  1.1329, -0.0083 },
+    {-0.0182, -0.1006,  1.1187 }
+};
+
+// Build an 8-bit LUT for fast display tone-mapping in the playback thread.
+// sws_scale to BGR24 from an HDR source outputs PQ/HLG-encoded values linearly
+// mapped to [0,255]; this LUT applies the inverse EOTF + Reinhard + sRGB.
+static void BuildHdrDisplayLut() {
+    bool   isPQ = (g_hdrTrc == AVCOL_TRC_SMPTE2084);
+    double refW = isPQ ? 0.0203 : 0.25;
+    for (int i = 0; i < 256; i++) {
+        double v   = i / 255.0;
+        double lin = isPQ ? pq_eotf(v) : hlg_eotf(v);
+        double tm  = reinhard_tm(lin, refW);
+        g_hdrDisplay8Lut[i] = srgb_pack(tm);
+    }
+    g_hdrLutValid = true;
+}
+
+// Detect HDR from container metadata; sets g_isHdr, g_hdrTrc, and rebuilds the LUT.
+static void DetectHdr(const char* filepath) {
+    g_isHdr       = false;
+    g_hdrTrc      = AVCOL_TRC_UNSPECIFIED;
+    g_hdrLutValid = false;
+    AVFormatContext* fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) return;
+    if (avformat_find_stream_info(fmt_ctx, nullptr) >= 0) {
+        for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
+            if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                AVColorTransferCharacteristic trc =
+                    fmt_ctx->streams[i]->codecpar->color_trc;
+                g_hdrTrc = (int)trc;
+                if (trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67)
+                    g_isHdr = true;
+                else if (fmt_ctx->streams[i]->codecpar->color_primaries == AVCOL_PRI_BT2020)
+                    g_isHdr = true;  // BT.2020 primaries without explicit TRC tag
+                break;
+            }
+        }
+    }
+    avformat_close_input(&fmt_ctx);
+    if (g_isHdr) BuildHdrDisplayLut();
+}
+
 // ------------------------------ Extract Middle Frame ------------------------------
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration) {
     AVFormatContext* fmt_ctx = nullptr;
@@ -1380,9 +1711,61 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
         if (pkt->stream_index == videoStreamIndex) {
             if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
             if (avcodec_receive_frame(dec_ctx, frame) == 0) {
-                sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
-                    rgbFrame->data, rgbFrame->linesize);
-                gotFrame = true;
+                bool isPQ  = (frame->color_trc == AVCOL_TRC_SMPTE2084);
+                bool isHLG = (frame->color_trc == AVCOL_TRC_ARIB_STD_B67);
+                if (isPQ || isHLG) {
+                    // Full-quality HDR→SDR: decode → RGB48LE → EOTF+matrix+TM → sRGB
+                    int srcCs = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
+                                 frame->colorspace == AVCOL_SPC_BT2020_CL)
+                                ? SWS_CS_BT2020 : SWS_CS_ITU709;
+                    int srcRange = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+                    SwsContext* hdr_sws = sws_getContext(
+                        dec_ctx->width, dec_ctx->height, (AVPixelFormat)frame->format,
+                        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB48LE,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    if (hdr_sws) {
+                        sws_setColorspaceDetails(hdr_sws,
+                            sws_getCoefficients(srcCs), srcRange,
+                            sws_getCoefficients(SWS_CS_ITU709), 1,
+                            0, 1 << 16, 1 << 16);
+                        int stride48 = dec_ctx->width * 6;
+                        uint8_t* rgb48 = (uint8_t*)av_malloc((size_t)dec_ctx->height * stride48);
+                        if (rgb48) {
+                            uint8_t* d[1] = { rgb48 }; int s[1] = { stride48 };
+                            sws_scale(hdr_sws, frame->data, frame->linesize,
+                                      0, dec_ctx->height, d, s);
+                            double refW = isPQ ? 0.0203 : 0.25;
+                            for (int row = 0; row < dec_ctx->height; row++) {
+                                const uint16_t* src16 =
+                                    (const uint16_t*)(rgb48 + row * stride48);
+                                uint8_t* dst =
+                                    rgbFrame->data[0] + row * rgbFrame->linesize[0];
+                                for (int x = 0; x < dec_ctx->width; x++) {
+                                    double R = src16[x*3+0] / 65535.0;
+                                    double G = src16[x*3+1] / 65535.0;
+                                    double B = src16[x*3+2] / 65535.0;
+                                    if (isPQ){ R=pq_eotf(R); G=pq_eotf(G); B=pq_eotf(B); }
+                                    else     { R=hlg_eotf(R);G=hlg_eotf(G);B=hlg_eotf(B); }
+                                    double Ro=k_bt2020_to_bt709[0][0]*R+k_bt2020_to_bt709[0][1]*G+k_bt2020_to_bt709[0][2]*B;
+                                    double Go=k_bt2020_to_bt709[1][0]*R+k_bt2020_to_bt709[1][1]*G+k_bt2020_to_bt709[1][2]*B;
+                                    double Bo=k_bt2020_to_bt709[2][0]*R+k_bt2020_to_bt709[2][1]*G+k_bt2020_to_bt709[2][2]*B;
+                                    if (Ro<0.0) Ro=0.0; if (Go<0.0) Go=0.0; if (Bo<0.0) Bo=0.0;
+                                    Ro=reinhard_tm(Ro,refW); Go=reinhard_tm(Go,refW); Bo=reinhard_tm(Bo,refW);
+                                    dst[x*3+0] = srgb_pack(Bo);
+                                    dst[x*3+1] = srgb_pack(Go);
+                                    dst[x*3+2] = srgb_pack(Ro);
+                                }
+                            }
+                            av_free(rgb48);
+                            gotFrame = true;
+                        }
+                        sws_freeContext(hdr_sws);
+                    }
+                } else {
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
+                        rgbFrame->data, rgbFrame->linesize);
+                    gotFrame = true;
+                }
                 av_frame_unref(frame);
                 av_packet_unref(pkt);
                 break;
@@ -1522,6 +1905,13 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                 while (avcodec_receive_frame(dec_ctx, frame) == 0) {
                     sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
                         rgbFrame->data, rgbFrame->linesize);
+                    if (g_isHdr && g_hdrLutValid) {
+                        for (int row = 0; row < dec_ctx->height; row++) {
+                            uint8_t* p = rgbFrame->data[0] + row * rgbFrame->linesize[0];
+                            for (int col = 0; col < dec_ctx->width * 3; col++)
+                                p[col] = g_hdrDisplay8Lut[p[col]];
+                        }
+                    }
 
                     // Create DIB
                     BITMAPINFO bmi = {};
@@ -1627,6 +2017,13 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
         while (avcodec_receive_frame(dec_ctx, frame) == 0) {
             sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
                 rgbFrame->data, rgbFrame->linesize);
+            if (g_isHdr && g_hdrLutValid) {
+                for (int row = 0; row < dec_ctx->height; row++) {
+                    uint8_t* p = rgbFrame->data[0] + row * rgbFrame->linesize[0];
+                    for (int col = 0; col < dec_ctx->width * 3; col++)
+                        p[col] = g_hdrDisplay8Lut[p[col]];
+                }
+            }
 
             BITMAPINFO bmi = {};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1818,7 +2215,7 @@ struct PgsEvent { int64_t pts_ms;  std::vector<PgsRect> rects; }; // rects.empty
 
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
     int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds,
-    int audio_stream_index, int subtitle_stream_index) {
+    int audio_stream_index, int subtitle_stream_index, bool convert_hdr_to_sdr) {
     int64_t           target_bitrate   = 0;
     AVFormatContext*  in_fmt_ctx       = nullptr;
     AVFormatContext*  out_fmt_ctx      = nullptr;
@@ -1831,11 +2228,17 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     const AVCodec*    video_decoder    = nullptr;
     const AVCodec*    video_encoder    = nullptr;
     SwsContext*       sws_ctx          = nullptr;
+    SwsContext*       sws_hdr2rgb      = nullptr;   // HDR→SDR: native → RGB48LE
+    SwsContext*       sws_rgb2yuv      = nullptr;   // HDR→SDR: BGR24 → encoder YUV
+    uint8_t*          hdr_rgb48_buf    = nullptr;   // intermediate RGB48LE plane
+    uint8_t*          hdr_bgr24_buf    = nullptr;   // intermediate BGR24 plane
     AVFilterGraph*    filter_graph     = nullptr;
     AVFilterContext*  buffersrc_ctx    = nullptr;
     AVFilterContext*  buffersink_ctx   = nullptr;
     bool              use_filter       = false;
     bool              use_bitmap_subs  = false;
+    int               pgs_plane_w      = 0;   // subtitle coordinate space (may differ from video for 4K)
+    int               pgs_plane_h      = 0;
     std::vector<PgsEvent> pgs_events;
     int               videoStreamIndex = -1;
     int               audioStreamIndex = -1;
@@ -1976,6 +2379,44 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     filt_frame->height = enc_ctx->height;
     if (av_frame_get_buffer(filt_frame, 32) < 0) { OutputDebugStringA("Could not allocate buffer for scaled frame.\n"); goto cleanup; }
 
+    if (convert_hdr_to_sdr) {
+        // Stage 1: decode native → RGB48LE with BT.2020 input colorspace
+        int srcCs    = (dec_ctx->colorspace == AVCOL_SPC_BT2020_NCL ||
+                        dec_ctx->colorspace == AVCOL_SPC_BT2020_CL)
+                       ? SWS_CS_BT2020 : SWS_CS_ITU709;
+        int srcRange = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+        sws_hdr2rgb = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+            enc_ctx->width, enc_ctx->height, AV_PIX_FMT_RGB48LE,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (sws_hdr2rgb) {
+            sws_setColorspaceDetails(sws_hdr2rgb,
+                sws_getCoefficients(srcCs),        srcRange,
+                sws_getCoefficients(SWS_CS_ITU709), 1,
+                0, 1 << 16, 1 << 16);
+        }
+        // Stage 3: BGR24 (BT.709 full-range) → encoder YUV (BT.709 limited-range)
+        sws_rgb2yuv = sws_getContext(enc_ctx->width, enc_ctx->height, AV_PIX_FMT_BGR24,
+            enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (sws_rgb2yuv) {
+            sws_setColorspaceDetails(sws_rgb2yuv,
+                sws_getCoefficients(SWS_CS_ITU709), 1,   // src: BT.709, full range (sRGB 0-255)
+                sws_getCoefficients(SWS_CS_ITU709), 0,   // dst: BT.709, limited range (H.264)
+                0, 1 << 16, 1 << 16);
+        }
+        hdr_rgb48_buf = (uint8_t*)av_malloc((size_t)enc_ctx->height * enc_ctx->width * 6);
+        hdr_bgr24_buf = (uint8_t*)av_malloc((size_t)enc_ctx->height * enc_ctx->width * 3);
+        if (!sws_hdr2rgb || !sws_rgb2yuv || !hdr_rgb48_buf || !hdr_bgr24_buf) {
+            OutputDebugStringA("HDR→SDR setup failed; falling back to direct encode.\n");
+            convert_hdr_to_sdr = false;
+        } else {
+            // Tag output as BT.709 so players know it's been tone-mapped
+            video_out_stream->codecpar->color_primaries = AVCOL_PRI_BT709;
+            video_out_stream->codecpar->color_trc       = AVCOL_TRC_BT709;
+            video_out_stream->codecpar->color_space     = AVCOL_SPC_BT709;
+        }
+    }
+
     // Pre-load bitmap subtitle events (PGS/VOBSUB) using a separate format context.
     // Text-based subtitles fall through to the libavfilter/libass path below.
     if (subtitle_stream_index >= 0 &&
@@ -1990,6 +2431,11 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
             if (sub_dec) {
                 avcodec_parameters_to_context(sub_dec, in_fmt_ctx->streams[subtitle_stream_index]->codecpar);
                 if (avcodec_open2(sub_dec, sub_codec, nullptr) >= 0) {
+                    // Record the subtitle plane dimensions so we can scale coords correctly.
+                    // 4K Blu-ray PGS subtitles are typically authored at 1920×1080 even
+                    // when the video track is 3840×2160.
+                    pgs_plane_w = sub_dec->width;
+                    pgs_plane_h = sub_dec->height;
                     AVFormatContext* sub_fmt = nullptr;
                     if (avformat_open_input(&sub_fmt, in_filename, nullptr, nullptr) >= 0 &&
                         avformat_find_stream_info(sub_fmt, nullptr) >= 0) {
@@ -2154,7 +2600,46 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                         else { src_frame = filter_out; }
                     }
                 }
-                sws_scale(sws_ctx, src_frame->data, src_frame->linesize, 0, src_frame->height, filt_frame->data, filt_frame->linesize);
+                if (convert_hdr_to_sdr && sws_hdr2rgb && sws_rgb2yuv && hdr_rgb48_buf && hdr_bgr24_buf) {
+                    // Stage 1: native → RGB48LE
+                    int rgb48W     = enc_ctx->width;
+                    int rgb48H     = enc_ctx->height;
+                    int rgb48Stride = rgb48W * 6;
+                    uint8_t* r48data[8] = { hdr_rgb48_buf, nullptr };
+                    int      r48stride[8] = { rgb48Stride, 0 };
+                    sws_scale(sws_hdr2rgb, src_frame->data, src_frame->linesize, 0, src_frame->height,
+                        r48data, r48stride);
+                    // Stage 2: per-pixel EOTF + BT.2020→BT.709 + Reinhard TM + sRGB
+                    bool   isPQ = (g_hdrTrc == AVCOL_TRC_SMPTE2084);
+                    double refW = isPQ ? 0.0203 : 0.25;
+                    for (int row = 0; row < rgb48H; row++) {
+                        const uint16_t* src16 = (const uint16_t*)(hdr_rgb48_buf + row * rgb48Stride);
+                        uint8_t* dst8         = hdr_bgr24_buf + row * rgb48W * 3;
+                        for (int x = 0; x < rgb48W; x++) {
+                            double R = src16[x*3+0] / 65535.0;
+                            double G = src16[x*3+1] / 65535.0;
+                            double B = src16[x*3+2] / 65535.0;
+                            if (isPQ) { R=pq_eotf(R); G=pq_eotf(G); B=pq_eotf(B); }
+                            else      { R=hlg_eotf(R);G=hlg_eotf(G);B=hlg_eotf(B); }
+                            double Ro = k_bt2020_to_bt709[0][0]*R+k_bt2020_to_bt709[0][1]*G+k_bt2020_to_bt709[0][2]*B;
+                            double Go = k_bt2020_to_bt709[1][0]*R+k_bt2020_to_bt709[1][1]*G+k_bt2020_to_bt709[1][2]*B;
+                            double Bo = k_bt2020_to_bt709[2][0]*R+k_bt2020_to_bt709[2][1]*G+k_bt2020_to_bt709[2][2]*B;
+                            if (Ro<0.0) Ro=0.0; if (Go<0.0) Go=0.0; if (Bo<0.0) Bo=0.0;
+                            Ro=reinhard_tm(Ro,refW); Go=reinhard_tm(Go,refW); Bo=reinhard_tm(Bo,refW);
+                            dst8[x*3+0] = srgb_pack(Bo);
+                            dst8[x*3+1] = srgb_pack(Go);
+                            dst8[x*3+2] = srgb_pack(Ro);
+                        }
+                    }
+                    // Stage 3: BGR24 → encoder YUV
+                    uint8_t* b24data[8]  = { hdr_bgr24_buf, nullptr };
+                    int      b24stride[8] = { rgb48W * 3, 0 };
+                    sws_scale(sws_rgb2yuv, (const uint8_t* const*)b24data, b24stride, 0, rgb48H,
+                        filt_frame->data, filt_frame->linesize);
+                } else {
+                    sws_scale(sws_ctx, src_frame->data, src_frame->linesize, 0, src_frame->height,
+                        filt_frame->data, filt_frame->linesize);
+                }
                 if (filter_out) av_frame_free(&filter_out);
 
                 // Alpha-blend PGS bitmap subtitle onto the scaled YUV output frame
@@ -2167,8 +2652,13 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                         else break;
                     }
                     if (active && !active->rects.empty()) {
-                        double sx = (double)enc_ctx->width  / dec_ctx->width;
-                        double sy = (double)enc_ctx->height / dec_ctx->height;
+                        // Scale from subtitle coordinate space → output frame.
+                        // Use the subtitle plane's own dimensions if available; fall back to
+                        // the decoded video size (handles non-4K sources where they match).
+                        int sub_ref_w = (pgs_plane_w > 0) ? pgs_plane_w : dec_ctx->width;
+                        int sub_ref_h = (pgs_plane_h > 0) ? pgs_plane_h : dec_ctx->height;
+                        double sx = (double)enc_ctx->width  / sub_ref_w;
+                        double sy = (double)enc_ctx->height / sub_ref_h;
                         for (const auto& rect : active->rects) {
                             for (int py = 0; py < rect.h; py++) {
                                 for (int px = 0; px < rect.w; px++) {
@@ -2262,6 +2752,10 @@ flush_encoder:
 cleanup:
     if (filter_graph) avfilter_graph_free(&filter_graph);
     if (sws_ctx) sws_freeContext(sws_ctx);
+    if (sws_hdr2rgb) sws_freeContext(sws_hdr2rgb);
+    if (sws_rgb2yuv) sws_freeContext(sws_rgb2yuv);
+    if (hdr_rgb48_buf) av_free(hdr_rgb48_buf);
+    if (hdr_bgr24_buf) av_free(hdr_bgr24_buf);
     if (frame) av_frame_free(&frame);
     if (filt_frame) av_frame_free(&filt_frame);
     if (pkt) av_packet_free(&pkt);
@@ -2277,52 +2771,6 @@ cleanup:
 }
 
 // ------------------------------ Filmstrip Thumbnail Extraction ------------------------------
-// ----- HDR → SDR tone-mapping helpers ----------------------------------------
-
-// Guard for older FFmpeg builds that don't define SWS_CS_BT2020
-#ifndef SWS_CS_BT2020
-#define SWS_CS_BT2020 9
-#endif
-
-// PQ (SMPTE ST 2084) EOTF: normalised signal [0,1] → linear light [0,1]
-// where 1.0 represents 10 000 nits.
-static double pq_eotf(double N) {
-    if (N <= 0.0) return 0.0;
-    const double m1 = 0.1593017578125, m2 = 78.84375;
-    const double c1 = 0.8359375,       c2 = 18.8515625, c3 = 18.6875;
-    double p   = pow(N, 1.0 / m2);
-    double num = p - c1; if (num < 0.0) num = 0.0;
-    double den = c2 - c3 * p;
-    return den > 0.0 ? pow(num / den, 1.0 / m1) : 0.0;
-}
-
-// HLG (ARIB STD-B67) OETF inverse: normalised signal [0,1] → scene-linear [0,1]
-static double hlg_eotf(double E) {
-    if (E < 0.0) return 0.0;
-    if (E <= 0.5) return (E * E) / 3.0;
-    const double a = 0.17883277, b = 0.28466892, c = 0.55991073;
-    return (exp((E - c) / a) + b) / 12.0;
-}
-
-// Extended Reinhard tone mapping (per-channel in linear light).
-// white: reference white in the same linear units as v.
-static inline double reinhard_tm(double v, double white) {
-    return v * (1.0 + v / (white * white)) / (1.0 + v);
-}
-
-// sRGB OETF: linear [0,1] → gamma-encoded [0,255] uint8
-static inline uint8_t srgb_pack(double v) {
-    double g = (v <= 0.0031308) ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
-    int i = (int)(g * 255.0 + 0.5);
-    return (uint8_t)(i < 0 ? 0 : i > 255 ? 255 : i);
-}
-
-// BT.2020 linear RGB → BT.709 linear RGB primaries matrix
-static const double k_bt2020_to_bt709[3][3] = {
-    { 1.6605, -0.5876, -0.0728 },
-    {-0.1246,  1.1329, -0.0083 },
-    {-0.0182, -0.1006,  1.1187 }
-};
 
 static HBITMAP ExtractFrameAtTime(const char* filepath, double timeSecs) {
     AVFormatContext* fmt_ctx = nullptr;
