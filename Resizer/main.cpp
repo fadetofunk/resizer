@@ -27,6 +27,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <process.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+#include <deque>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -37,6 +40,7 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
@@ -1471,11 +1475,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
 
                 char candidate[MAX_PATH];
-                StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s%s", outDir, fname, suffixA, ext);
+                StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s.mp4", outDir, fname, suffixA);
                 if (_access(candidate, 0) == 0) {
                     for (int i = 1;; i++) {
-                        StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s-%d%s",
-                                         outDir, fname, suffixA, i, ext);
+                        StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s-%d.mp4",
+                                         outDir, fname, suffixA, i);
                         if (_access(candidate, 0) != 0) break;
                     }
                 }
@@ -2075,6 +2079,21 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
     int              rgbBufSize = 0;
     bool             using_hw = false;
 
+    // Audio playback state
+    int              audioStreamIdx  = -1;
+    AVCodecContext*  aDecCtx         = nullptr;
+    SwrContext*      swrCtx          = nullptr;
+    HWAVEOUT         hWaveOut        = nullptr;
+    AVFrame*         aFrame          = nullptr;
+    bool             waveOutIsPaused = false;
+    std::deque<WAVEHDR*> waveBlocks;
+
+    // PTS-based video timing
+    bool      timingInit     = false;
+    ULONGLONG t0Wall         = 0;
+    int64_t   t0PtsMs        = 0;
+    bool      prevWasPlaying = false; // initialised below after audio init
+
     bool init_ok = false;
     do {
         if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) break;
@@ -2128,6 +2147,51 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
         return 0;
     }
 
+    // Optional audio init — failure means silent playback, not an error.
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams && audioStreamIdx < 0; i++)
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            audioStreamIdx = (int)i;
+
+    if (audioStreamIdx >= 0) {
+        AVStream* aStream   = fmt_ctx->streams[audioStreamIdx];
+        const AVCodec* aDec = avcodec_find_decoder(aStream->codecpar->codec_id);
+        aDecCtx = aDec ? avcodec_alloc_context3(aDec) : nullptr;
+        if (aDecCtx && avcodec_parameters_to_context(aDecCtx, aStream->codecpar) >= 0
+                    && avcodec_open2(aDecCtx, aDec, nullptr) >= 0) {
+            swrCtx = swr_alloc();
+        }
+        if (swrCtx) {
+            AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+            av_opt_set_chlayout  (swrCtx, "in_chlayout",    &aDecCtx->ch_layout,   0);
+            av_opt_set_int       (swrCtx, "in_sample_rate",  aDecCtx->sample_rate,  0);
+            av_opt_set_sample_fmt(swrCtx, "in_sample_fmt",   aDecCtx->sample_fmt,   0);
+            av_opt_set_chlayout  (swrCtx, "out_chlayout",   &stereo,                0);
+            av_opt_set_int       (swrCtx, "out_sample_rate", aDecCtx->sample_rate,  0);
+            av_opt_set_sample_fmt(swrCtx, "out_sample_fmt",  AV_SAMPLE_FMT_S16,     0);
+            if (swr_init(swrCtx) < 0) { swr_free(&swrCtx); swrCtx = nullptr; }
+        }
+        if (swrCtx) {
+            WAVEFORMATEX wfx      = {};
+            wfx.wFormatTag        = WAVE_FORMAT_PCM;
+            wfx.nChannels         = 2;
+            wfx.nSamplesPerSec    = (DWORD)aDecCtx->sample_rate;
+            wfx.wBitsPerSample    = 16;
+            wfx.nBlockAlign       = 4;
+            wfx.nAvgBytesPerSec   = (DWORD)(aDecCtx->sample_rate * 4);
+            if (waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) == MMSYSERR_NOERROR)
+                aFrame = av_frame_alloc();
+            else
+                hWaveOut = nullptr;
+        }
+        if (!hWaveOut) {
+            if (swrCtx)  { swr_free(&swrCtx);           swrCtx  = nullptr; }
+            if (aDecCtx) { avcodec_free_context(&aDecCtx); aDecCtx = nullptr; }
+            audioStreamIdx = -1;
+        }
+    }
+
+    prevWasPlaying = g_isPlaying; // avoid spurious pause/resume transition on first tick
+
     auto doSeek = [&](int64_t toMs) {
         int64_t ts = av_rescale_q(toMs, AVRational{ 1,1000 }, videoStream->time_base);
         av_seek_frame(fmt_ctx, videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
@@ -2141,7 +2205,34 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
         if (g_seekRequested) {
             int64_t target = g_seekTargetMs;
             g_seekRequested = false;
+            if (hWaveOut) {
+                waveOutReset(hWaveOut);
+                waveOutIsPaused = false;
+                for (WAVEHDR* wh : waveBlocks) {
+                    waveOutUnprepareHeader(hWaveOut, wh, sizeof(WAVEHDR));
+                    delete[] (uint8_t*)wh->lpData;
+                    delete wh;
+                }
+                waveBlocks.clear();
+            }
+            if (aDecCtx) avcodec_flush_buffers(aDecCtx);
+            timingInit = false;
             doSeek(target);
+        }
+
+        // Pause / resume detection
+        {
+            bool nowPlaying = g_isPlaying;
+            if (prevWasPlaying && !nowPlaying && hWaveOut) {
+                waveOutPause(hWaveOut);
+                waveOutIsPaused = true;
+                timingInit = false;
+            }
+            if (!prevWasPlaying && nowPlaying && hWaveOut) {
+                if (waveOutIsPaused) { waveOutRestart(hWaveOut); waveOutIsPaused = false; }
+                timingInit = false;
+            }
+            prevWasPlaying = nowPlaying;
         }
 
         // Paused single-frame preview with proper step logic
@@ -2275,6 +2366,43 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             g_isPlaying = false;
             continue;
         }
+        // Audio packet — decode, resample, feed to waveOut
+        if (pkt->stream_index == audioStreamIdx && aDecCtx && hWaveOut) {
+            // Reclaim completed buffers to avoid unbounded growth
+            while (!waveBlocks.empty() && (waveBlocks.front()->dwFlags & WHDR_DONE)) {
+                WAVEHDR* wh = waveBlocks.front();
+                waveOutUnprepareHeader(hWaveOut, wh, sizeof(WAVEHDR));
+                delete[] (uint8_t*)wh->lpData;
+                delete wh;
+                waveBlocks.pop_front();
+            }
+            if (avcodec_send_packet(aDecCtx, pkt) >= 0) {
+                while (avcodec_receive_frame(aDecCtx, aFrame) == 0) {
+                    int maxSamples = (int)av_rescale_rnd(
+                        swr_get_delay(swrCtx, aDecCtx->sample_rate) + aFrame->nb_samples,
+                        aDecCtx->sample_rate, aDecCtx->sample_rate, AV_ROUND_UP);
+                    uint8_t* pcm = new uint8_t[(size_t)maxSamples * 4];
+                    uint8_t* outPtrs[1] = { pcm };
+                    int outSamples = swr_convert(swrCtx, outPtrs, maxSamples,
+                        (const uint8_t**)aFrame->data, aFrame->nb_samples);
+                    if (outSamples > 0) {
+                        WAVEHDR* wh  = new WAVEHDR{};
+                        wh->lpData        = (LPSTR)pcm;
+                        wh->dwBufferLength = (DWORD)(outSamples * 4);
+                        wh->dwFlags       = 0;
+                        waveOutPrepareHeader(hWaveOut, wh, sizeof(WAVEHDR));
+                        waveOutWrite(hWaveOut, wh, sizeof(WAVEHDR));
+                        waveBlocks.push_back(wh);
+                        pcm = nullptr; // owned by wh
+                    }
+                    delete[] pcm; // no-op if transferred
+                    av_frame_unref(aFrame);
+                }
+            }
+            av_packet_unref(pkt);
+            continue;
+        }
+
         if (pkt->stream_index != videoStreamIndex) {
             av_packet_unref(pkt);
             continue;
@@ -2328,13 +2456,24 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                     memcpy((uint8_t*)dibBits + y * rowBytes,
                         rgbFrame->data[0] + y * rgbFrame->linesize[0], rowBytes);
                 }
+                int64_t ms = (int64_t)(frame->best_effort_timestamp *
+                    av_q2d(videoStream->time_base) * 1000.0);
+                // PTS-based timing: sleep until this frame is due
+                if (!timingInit) {
+                    t0Wall   = GetTickCount64();
+                    t0PtsMs  = ms;
+                    timingInit = true;
+                } else {
+                    int64_t elapsed = (int64_t)(GetTickCount64() - t0Wall);
+                    int64_t due     = ms - t0PtsMs;
+                    if (due > elapsed + 2)
+                        Sleep((DWORD)(due - elapsed));
+                }
                 EnterCriticalSection(&g_csState);
                 if (g_hFrameBitmap) DeleteObject(g_hFrameBitmap);
                 g_hFrameBitmap = hNew;
-                g_frameWidth = dec_ctx->width;
-                g_frameHeight = dec_ctx->height;
-                int64_t ms = (int64_t)(frame->best_effort_timestamp *
-                    av_q2d(videoStream->time_base) * 1000.0);
+                g_frameWidth   = dec_ctx->width;
+                g_frameHeight  = dec_ctx->height;
                 g_currentPosMs = ms;
                 LeaveCriticalSection(&g_csState);
             }
@@ -2342,11 +2481,24 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             av_frame_unref(frame);
         }
         av_packet_unref(pkt);
-
-        Sleep((DWORD)max(1.0, 1000.0 / g_videoFPS));
     }
 
-    // cleanup
+    // cleanup — audio first so waveOut stops before we free FFmpeg state
+    if (hWaveOut) {
+        waveOutReset(hWaveOut);
+        for (WAVEHDR* wh : waveBlocks) {
+            waveOutUnprepareHeader(hWaveOut, wh, sizeof(WAVEHDR));
+            delete[] (uint8_t*)wh->lpData;
+            delete wh;
+        }
+        waveBlocks.clear();
+        waveOutClose(hWaveOut);
+    }
+    if (aFrame)  av_frame_free(&aFrame);
+    if (swrCtx)  swr_free(&swrCtx);
+    if (aDecCtx) avcodec_free_context(&aDecCtx);
+
+    // video cleanup
     if (pkt) av_packet_free(&pkt);
     if (cpu_frame) av_frame_free(&cpu_frame);
     if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
@@ -2601,8 +2753,24 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     enc_ctx->height = orig_h / scale_factor;
     enc_ctx->width = orig_w / scale_factor;
     enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
-    if (strcmp(video_encoder->name, "h264_nvenc") == 0) enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
-    else { enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P; av_opt_set(enc_ctx->priv_data, "preset", "medium", 0); av_opt_set(enc_ctx->priv_data, "nal-hrd", "cbr", 0); }
+    // Use YUV420P for both h264_nvenc and libx264.  h264_nvenc accepts YUV420P
+    // and converts to NV12 internally; this avoids semi-planar UV confusion when
+    // the decoded frame (NV12 from NVDEC) is scaled or filtered.
+    enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    if (strcmp(video_encoder->name, "h264_nvenc") == 0) {
+        av_opt_set(enc_ctx->priv_data, "preset", "p4",  0);
+        av_opt_set(enc_ctx->priv_data, "rc",     "cbr", 0);
+    } else {
+        av_opt_set(enc_ctx->priv_data, "preset",  "medium", 0);
+        av_opt_set(enc_ctx->priv_data, "nal-hrd", "cbr",    0);
+    }
+    // Propagate input colour-space metadata so players decode with the right matrix/range.
+    if (!convert_hdr_to_sdr) {
+        enc_ctx->color_range     = video_in_stream->codecpar->color_range;
+        enc_ctx->color_primaries = video_in_stream->codecpar->color_primaries;
+        enc_ctx->color_trc       = video_in_stream->codecpar->color_trc;
+        enc_ctx->colorspace      = video_in_stream->codecpar->color_space;
+    }
     {
         // Prefer codec framerate, fall back to stream's avg_frame_rate, then 30 fps
         AVRational fps = dec_ctx->framerate;
@@ -2809,11 +2977,19 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 char src_args[256];
                 AVRational tb  = video_in_stream->time_base;
                 AVRational sar = dec_ctx->sample_aspect_ratio;
-                // With NVDEC, dec_ctx->pix_fmt == AV_PIX_FMT_CUDA; use the stream's
-                // software format instead so buffersrc gets a valid pixel format.
-                AVPixelFormat filter_fmt = using_hw
-                    ? (AVPixelFormat)video_in_stream->codecpar->format
-                    : dec_ctx->pix_fmt;
+                // With NVDEC, dec_ctx->pix_fmt == AV_PIX_FMT_CUDA.  Use the actual
+                // software transfer format from the hw_frames_ctx (e.g. NV12) so the
+                // buffersrc matches the frames we will actually feed it.  Falling back
+                // to the codecpar format (YUV420P) caused a semi-planar / planar
+                // mismatch that corrupted chroma and produced a green tint.
+                AVPixelFormat filter_fmt;
+                if (using_hw && dec_ctx->hw_frames_ctx) {
+                    filter_fmt = ((AVHWFramesContext*)dec_ctx->hw_frames_ctx->data)->sw_format;
+                } else if (using_hw) {
+                    filter_fmt = (AVPixelFormat)video_in_stream->codecpar->format;
+                } else {
+                    filter_fmt = dec_ctx->pix_fmt;
+                }
                 snprintf(src_args, sizeof(src_args),
                     "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
                     dec_ctx->width, dec_ctx->height, (int)filter_fmt,
@@ -2911,13 +3087,6 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     }
                 }
 
-                // Lazy-init sws_ctx (non-HDR path) on first decoded frame.
-                if (!sws_ctx) {
-                    sws_ctx = sws_getContext(
-                        dec_ctx->width, dec_ctx->height, (AVPixelFormat)sw_frame->format,
-                        enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-                }
                 // Lazy-init sws_hdr2rgb (HDR→SDR Stage 1) on first decoded frame.
                 if (convert_hdr_to_sdr && !sws_hdr2rgb) {
                     int srcCs    = (dec_ctx->colorspace == AVCOL_SPC_BT2020_NCL ||
@@ -2956,6 +3125,16 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                         if (fret < 0) { av_frame_free(&filter_out); filter_out = nullptr; }
                         else { src_frame = filter_out; }
                     }
+                }
+                // Lazy-init sws_ctx (non-HDR path) using the ACTUAL source frame format
+                // (post-filter).  Initialising from sw_frame before the filter ran could
+                // produce a format mismatch when NVDEC outputs NV12 but the filter graph
+                // was configured for YUV420P — causing incorrect chroma (green tint).
+                if (!sws_ctx) {
+                    sws_ctx = sws_getContext(
+                        src_frame->width, src_frame->height, (AVPixelFormat)src_frame->format,
+                        enc_ctx->width,   enc_ctx->height,   enc_ctx->pix_fmt,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
                 }
                 if (convert_hdr_to_sdr && sws_hdr2rgb && sws_rgb2yuv && hdr_rgb48_buf && hdr_bgr24_buf) {
                     // Stage 1: native → RGB48LE
