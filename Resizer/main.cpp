@@ -2105,6 +2105,7 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
     ULONGLONG t0Wall         = 0;
     int64_t   t0PtsMs        = 0;
     bool      prevWasPlaying = false; // initialised below after audio init
+    int64_t   catchUpToMs    = -1;   // skip frames before this PTS after a seek
 
     bool init_ok = false;
     do {
@@ -2230,6 +2231,7 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             if (aDecCtx) avcodec_flush_buffers(aDecCtx);
             timingInit = false;
             doSeek(target);
+            catchUpToMs = target;  // discard frames before the actual seek target
         }
 
         // Pause / resume detection
@@ -2431,6 +2433,15 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                 if (cpu_frame && av_hwframe_transfer_data(cpu_frame, frame, 0) >= 0)
                     sw_frame = cpu_frame;
             }
+            // Compute PTS early so we can skip frames still before the seek target.
+            int64_t ms = (int64_t)(frame->best_effort_timestamp *
+                av_q2d(videoStream->time_base) * 1000.0);
+            if (catchUpToMs >= 0 && ms < catchUpToMs) {
+                av_frame_unref(frame);
+                continue;  // discard — still catching up to the seek target
+            }
+            catchUpToMs = -1;
+
             // Lazy-init sws_ctx on first decoded frame.
             if (!sws_ctx) {
                 sws_ctx = sws_getContext(
@@ -2468,8 +2479,6 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                     memcpy((uint8_t*)dibBits + y * rowBytes,
                         rgbFrame->data[0] + y * rgbFrame->linesize[0], rowBytes);
                 }
-                int64_t ms = (int64_t)(frame->best_effort_timestamp *
-                    av_q2d(videoStream->time_base) * 1000.0);
                 // PTS-based timing: sleep until this frame is due
                 if (!timingInit) {
                     t0Wall   = GetTickCount64();
