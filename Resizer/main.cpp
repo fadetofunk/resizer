@@ -103,6 +103,8 @@ extern "C" {
 static HWND     g_mainHwnd = nullptr;
 
 static char     g_inputPath[MAX_PATH] = { 0 };
+static char     g_extSubPaths[8][MAX_PATH] = {};  // external subtitle files found next to video
+static int      g_extSubCount = 0;
 static int      g_vidWidth = 0;
 static int      g_vidHeight = 0;
 static double   g_duration = 0.0; // seconds
@@ -229,10 +231,12 @@ bool GetVideoInfo(const char* filepath, int& width, int& height, double& duratio
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
     int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds,
-    int audio_stream_index = -1, int subtitle_stream_index = -1, bool convert_hdr_to_sdr = false);
+    int audio_stream_index = -1, int subtitle_stream_index = -1, bool convert_hdr_to_sdr = false,
+    const char* ext_subtitle_path = nullptr);
 
 // Audio/subtitle track enumeration
 static void PopulateAudioAndSubsDropdowns(const char* filepath);
+static void ScanExternalSubtitles(const char* videoPath);
 static void DetectHdr(const char* filepath);
 
 // Playback helpers
@@ -300,6 +304,7 @@ struct EncodeArgs {
     int    selAudio, selSubs;
     bool   convertHdrToSdr;
     HWND   hwnd;
+    char   extSubPath[MAX_PATH]; // external subtitle file (empty = none)
 };
 
 static unsigned __stdcall EncodeThreadProc(void* param) {
@@ -310,7 +315,8 @@ static unsigned __stdcall EncodeThreadProc(void* param) {
         args->inPath, args->outPath, args->targetSizeMB,
         args->scaleFactor, args->origW, args->origH,
         args->startSecs, args->endSecs,
-        args->selAudio, args->selSubs, args->convertHdrToSdr);
+        args->selAudio, args->selSubs, args->convertHdrToSdr,
+        args->extSubPath[0] ? args->extSubPath : nullptr);
     g_encodeProgress = ok ? 1.0f : 0.0f;
     g_encodeRunning  = false;
     PostMessage(args->hwnd, WM_APP_ENCODE_DONE, ok ? 1 : 0, 0);
@@ -1255,6 +1261,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(g_hSubsDrop,    TRUE);
                 PopulateAudioAndSubsDropdowns(g_inputPath);
 
+                // Auto-detect external subtitle files (.srt/.ass/.ssa) next to the video
+                ScanExternalSubtitles(g_inputPath);
+                for (int ei = 0; ei < g_extSubCount; ei++) {
+                    const char* fname = strrchr(g_extSubPaths[ei], '\\');
+                    if (!fname) fname = strrchr(g_extSubPaths[ei], '/');
+                    fname = fname ? fname + 1 : g_extSubPaths[ei];
+                    char labelA[MAX_PATH + 16];
+                    StringCchPrintfA(labelA, sizeof(labelA), "External: %s", fname);
+                    wchar_t labelW[MAX_PATH + 16];
+                    MultiByteToWideChar(CP_UTF8, 0, labelA, -1, labelW, MAX_PATH + 16);
+                    LRESULT ni = SendMessage(g_hSubsDrop, CB_ADDSTRING, 0, (LPARAM)labelW);
+                    // item data -2, -3, ... → index 0, 1, ... into g_extSubPaths
+                    SendMessage(g_hSubsDrop, CB_SETITEMDATA, ni, (LPARAM)(INT_PTR)(-(ei + 2)));
+                }
+
                 DetectHdr(g_inputPath);
                 SendMessage(g_hColorDrop, CB_RESETCONTENT, 0, 0);
                 if (g_isHdr) {
@@ -1489,12 +1510,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
 
             // Read user-selected audio and subtitle stream indices
-            int selAudio = -1, selSubs = -1;
+            int  selAudio = -1, selSubs = -1;
+            char selExtSubPath[MAX_PATH] = {};
             {
                 LRESULT a = SendMessage(g_hAudioDrop, CB_GETCURSEL, 0, 0);
                 if (a != CB_ERR) selAudio = (int)(INT_PTR)SendMessage(g_hAudioDrop, CB_GETITEMDATA, a, 0);
                 LRESULT s = SendMessage(g_hSubsDrop, CB_GETCURSEL, 0, 0);
-                if (s != CB_ERR) selSubs  = (int)(INT_PTR)SendMessage(g_hSubsDrop,  CB_GETITEMDATA, s, 0);
+                if (s != CB_ERR) {
+                    int data = (int)(INT_PTR)SendMessage(g_hSubsDrop, CB_GETITEMDATA, s, 0);
+                    if (data >= 0) {
+                        selSubs = data;           // embedded stream index
+                    } else if (data <= -2) {
+                        int extIdx = -(data + 2); // 0-based into g_extSubPaths
+                        if (extIdx < g_extSubCount)
+                            StringCchCopyA(selExtSubPath, MAX_PATH, g_extSubPaths[extIdx]);
+                    }
+                    // data == -1: None — leave both at defaults
+                }
             }
 
             bool convertHdrToSdr = false;
@@ -1520,6 +1552,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             args->selSubs        = selSubs;
             args->convertHdrToSdr = convertHdrToSdr;
             args->hwnd           = hwnd;
+            StringCchCopyA(args->extSubPath, MAX_PATH, selExtSubPath);
 
             g_encodeProgress = 0.0f;
             g_encodeRunning  = true;
@@ -1676,6 +1709,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
+}
+
+// ------------------------------ External Subtitle Detection ------------------------------
+// Scans for .srt/.ass/.ssa/.sub/.vtt files next to the video with the same base name.
+static void ScanExternalSubtitles(const char* videoPath) {
+    memset(g_extSubPaths, 0, sizeof(g_extSubPaths));
+    g_extSubCount = 0;
+
+    // Split videoPath into directory + base name (without extension)
+    char dir[MAX_PATH], base[MAX_PATH];
+    StringCchCopyA(dir, MAX_PATH, videoPath);
+    char* lastSep = strrchr(dir, '\\');
+    if (!lastSep) lastSep = strrchr(dir, '/');
+    if (lastSep) {
+        StringCchCopyA(base, MAX_PATH, lastSep + 1);
+        *(lastSep + 1) = '\0';
+    } else {
+        StringCchCopyA(base, MAX_PATH, dir);
+        dir[0] = '\0';
+    }
+    char* dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+
+    const char* exts[] = { ".srt", ".ass", ".ssa", ".sub", ".vtt" };
+    for (const char* ext : exts) {
+        if (g_extSubCount >= 8) break;
+        char candidate[MAX_PATH];
+        StringCchPrintfA(candidate, MAX_PATH, "%s%s%s", dir, base, ext);
+        if (_access(candidate, 0) == 0)
+            StringCchCopyA(g_extSubPaths[g_extSubCount++], MAX_PATH, candidate);
+    }
 }
 
 // ------------------------------ Audio / Subtitle Track Enumeration ------------------------------
@@ -2382,6 +2446,11 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
         }
         // Audio packet — decode, resample, feed to waveOut
         if (pkt->stream_index == audioStreamIdx && aDecCtx && hWaveOut) {
+            // Skip audio during video seek catchup to prevent AV desync:
+            // waveOut starts playing the moment the first buffer is written, so
+            // if we feed audio before video has caught up to the target PTS the
+            // audio will be ahead of the picture by up to one keyframe interval.
+            if (catchUpToMs >= 0) { av_packet_unref(pkt); continue; }
             // Reclaim completed buffers to avoid unbounded growth
             while (!waveBlocks.empty() && (waveBlocks.front()->dwFlags & WHDR_DONE)) {
                 WAVEHDR* wh = waveBlocks.front();
@@ -2674,10 +2743,13 @@ void SetMarkOutFromCurrent(HWND hwnd) {
 // colour conversion.
 struct PgsRect  { int x, y, w, h; std::vector<uint8_t> yuva; };
 struct PgsEvent { int64_t pts_ms;  std::vector<PgsRect> rects; }; // rects.empty() = clear screen
+// Text subtitle event decoded from SUBTITLE_ASS / SUBTITLE_TEXT rects (fallback path)
+struct TextSubEvent { double start_s, end_s; std::string ass_text; };
 
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
     int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds,
-    int audio_stream_index, int subtitle_stream_index, bool convert_hdr_to_sdr) {
+    int audio_stream_index, int subtitle_stream_index, bool convert_hdr_to_sdr,
+    const char* ext_subtitle_path) {
     int64_t           target_bitrate   = 0;
     AVFormatContext*  in_fmt_ctx       = nullptr;
     AVFormatContext*  out_fmt_ctx      = nullptr;
@@ -2701,7 +2773,9 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     bool              use_bitmap_subs  = false;
     int               pgs_plane_w      = 0;   // subtitle coordinate space (may differ from video for 4K)
     int               pgs_plane_h      = 0;
-    std::vector<PgsEvent> pgs_events;
+    std::vector<PgsEvent>    pgs_events;
+    std::vector<TextSubEvent> text_sub_events;
+    char                     temp_ass_path[MAX_PATH] = {};  // temp ASS file for subtitle fallback
     int               videoStreamIndex = -1;
     int               audioStreamIndex = -1;
     AVFrame*          frame            = nullptr;
@@ -2741,12 +2815,15 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     video_in_stream = in_fmt_ctx->streams[videoStreamIndex];
     if (audioStreamIndex >= 0) audio_in_stream = in_fmt_ctx->streams[audioStreamIndex];
 
-    // Bitrate calculation: subtract the actual audio stream bitrate so video uses the remaining budget
+    // Bitrate calculation: subtract audio and a safety margin so the encoder's CBR
+    // overshoot and container overhead never push the file over the target size.
+    // 5% overhead absorbs: ~1-2% MP4 container (moov/stbl index tables) + 3-4%
+    // NVENC CBR overshoot, which is content-dependent and causes occasional oversize.
     {
         int64_t total_bits    = (int64_t)(target_size_mb * 8.0 * 1024.0 * 1024.0);
         int64_t audio_bitrate = audio_in_stream ? 192000 : 0; // always encode stereo AAC @ 192 kbps
         int64_t audio_bits  = (int64_t)(audio_bitrate * segment_duration);
-        int64_t overhead    = (int64_t)(total_bits * 0.01); // ~1% for container overhead
+        int64_t overhead    = (int64_t)(total_bits * 0.05); // 5% covers container + encoder overshoot
         int64_t video_bits  = total_bits - audio_bits - overhead;
         if (video_bits <= 0) video_bits = total_bits / 2;  // audio alone exceeds budget; give video 50%
         target_bitrate = (int64_t)(video_bits / segment_duration);
@@ -2783,7 +2860,10 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     if (strcmp(video_encoder->name, "h264_nvenc") == 0) {
         av_opt_set(enc_ctx->priv_data, "preset", "p4",  0);
-        av_opt_set(enc_ctx->priv_data, "rc",     "cbr", 0);
+        // vbr + explicit maxrate enforces the ceiling more accurately than cbr
+        // across all NVENC driver versions; cbr can overshoot by 3-8% on
+        // complex content because the driver-side rate controller isn't HRD-exact.
+        av_opt_set(enc_ctx->priv_data, "rc", "vbr", 0);
     } else {
         av_opt_set(enc_ctx->priv_data, "preset",  "medium", 0);
         av_opt_set(enc_ctx->priv_data, "nal-hrd", "cbr",    0);
@@ -2804,9 +2884,9 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         enc_ctx->max_b_frames = 0;  // no B-frames → DTS always == PTS → clean seeking
         enc_ctx->gop_size     = max(1, (int)(av_q2d(fps) * 2.0)); // keyframe every ~2 s
     }
-    enc_ctx->bit_rate = target_bitrate;
-    enc_ctx->rc_max_rate = target_bitrate;
-    enc_ctx->rc_buffer_size = target_bitrate;
+    enc_ctx->bit_rate       = target_bitrate;
+    enc_ctx->rc_max_rate    = target_bitrate;
+    enc_ctx->rc_buffer_size = target_bitrate * 2; // 2-second VBV window for smoother rate control
     if (out_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (avcodec_open2(enc_ctx, video_encoder, nullptr) < 0) { OutputDebugStringA("Could not open video encoder.\n"); goto cleanup; }
     if (avcodec_parameters_from_context(video_out_stream->codecpar, enc_ctx) < 0) { OutputDebugStringA("Failed to copy encoder params to output.\n"); goto cleanup; }
@@ -2951,7 +3031,8 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         AVCodecID cid = in_fmt_ctx->streams[subtitle_stream_index]->codecpar->codec_id;
         bool is_bitmap = (cid == AV_CODEC_ID_HDMV_PGS_SUBTITLE ||
                           cid == AV_CODEC_ID_DVD_SUBTITLE ||
-                          cid == AV_CODEC_ID_XSUB);
+                          cid == AV_CODEC_ID_XSUB ||
+                          cid == AV_CODEC_ID_DVB_SUBTITLE);
         if (is_bitmap) {
             const AVCodec* sub_codec = avcodec_find_decoder(cid);
             AVCodecContext* sub_dec = sub_codec ? avcodec_alloc_context3(sub_codec) : nullptr;
@@ -3041,9 +3122,78 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         }
     }
 
+    // External subtitle file (.srt/.ass/.ssa alongside the video) — set up filter directly.
+    if (ext_subtitle_path && ext_subtitle_path[0] && !use_bitmap_subs) {
+        const AVFilter* buffersrc  = avfilter_get_by_name("buffer");
+        const AVFilter* buffersink = avfilter_get_by_name("buffersink");
+        if (buffersrc && buffersink) {
+            filter_graph = avfilter_graph_alloc();
+            if (filter_graph) {
+                char src_args[256];
+                AVRational tb  = video_in_stream->time_base;
+                AVRational sar = dec_ctx->sample_aspect_ratio;
+                AVPixelFormat filter_fmt;
+                if (using_hw && dec_ctx->hw_frames_ctx)
+                    filter_fmt = ((AVHWFramesContext*)dec_ctx->hw_frames_ctx->data)->sw_format;
+                else if (using_hw)
+                    filter_fmt = (AVPixelFormat)video_in_stream->codecpar->format;
+                else
+                    filter_fmt = dec_ctx->pix_fmt;
+                snprintf(src_args, sizeof(src_args),
+                    "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                    dec_ctx->width, dec_ctx->height, (int)filter_fmt,
+                    tb.num, tb.den, sar.num ? sar.num : 1, sar.den ? sar.den : 1);
+                int ret = avfilter_graph_create_filter(&buffersrc_ctx,  buffersrc,  "in",  src_args, nullptr, filter_graph);
+                if (ret >= 0)
+                    ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", nullptr,  nullptr, filter_graph);
+                if (ret >= 0) {
+                    char esc[MAX_PATH * 2]; int k = 0;
+                    for (int j = 0; ext_subtitle_path[j] && k < (int)sizeof(esc)-2; j++) {
+                        char c = ext_subtitle_path[j];
+                        esc[k++] = (c == '\\') ? '/' : c;
+                    }
+                    esc[k] = '\0';
+                    char windir[MAX_PATH] = {};
+                    GetWindowsDirectoryA(windir, MAX_PATH);
+                    char fontspath[MAX_PATH + 8];
+                    snprintf(fontspath, sizeof(fontspath), "%s/Fonts", windir);
+                    for (int j = 0; fontspath[j]; j++)
+                        if (fontspath[j] == '\\') fontspath[j] = '/';
+                    char filter_descr[MAX_PATH * 2 + 256];
+                    snprintf(filter_descr, sizeof(filter_descr),
+                        "subtitles='%s':fontsdir='%s'", esc, fontspath);
+                    AVFilterInOut* outputs = avfilter_inout_alloc();
+                    AVFilterInOut* inputs  = avfilter_inout_alloc();
+                    if (outputs && inputs) {
+                        outputs->name = av_strdup("in");  outputs->filter_ctx = buffersrc_ctx;  outputs->pad_idx = 0; outputs->next = nullptr;
+                        inputs->name  = av_strdup("out"); inputs->filter_ctx  = buffersink_ctx; inputs->pad_idx  = 0; inputs->next  = nullptr;
+                        ret = avfilter_graph_parse_ptr(filter_graph, filter_descr, &inputs, &outputs, nullptr);
+                        if (ret >= 0) ret = avfilter_graph_config(filter_graph, nullptr);
+                    }
+                    avfilter_inout_free(&outputs);
+                    avfilter_inout_free(&inputs);
+                    if (ret >= 0) {
+                        use_filter = true;
+                    } else {
+                        char errbuf[256]; av_strerror(ret, errbuf, sizeof(errbuf));
+                        char msg[MAX_PATH * 2 + 512];
+                        snprintf(msg, sizeof(msg),
+                            "External subtitle filter failed.\n\nFile: %s\nError: %s",
+                            ext_subtitle_path, errbuf);
+                        MessageBoxA(nullptr, msg, "Subtitle Error", MB_OK | MB_ICONWARNING);
+                        avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                        buffersrc_ctx = nullptr; buffersink_ctx = nullptr;
+                    }
+                } else {
+                    avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                }
+            }
+        }
+    }
+
     // Set up subtitle burn-in filter graph if a subtitle stream was selected
     // (text-based subtitles only — bitmap types handled by use_bitmap_subs above)
-    if (subtitle_stream_index >= 0 && !use_bitmap_subs) {
+    if (subtitle_stream_index >= 0 && !use_bitmap_subs && !use_filter) {
         const AVFilter* buffersrc  = avfilter_get_by_name("buffer");
         const AVFilter* buffersink = avfilter_get_by_name("buffersink");
         if (buffersrc && buffersink) {
@@ -3118,13 +3268,156 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     if (ret >= 0) {
                         use_filter = true;
                     } else {
-                        char errbuf[256]; av_strerror(ret, errbuf, sizeof(errbuf));
-                        char msg[MAX_PATH * 2 + 512];
-                        snprintf(msg, sizeof(msg),
-                            "Subtitle filter setup failed.\n\nError: %s\n\nFilter string:\n%s",
-                            errbuf, filter_descr);
-                        MessageBoxA(nullptr, msg, "Subtitle Error", MB_OK | MB_ICONWARNING);
+                        // Primary subtitles filter failed — pre-decode subtitle events via
+                        // avcodec_decode_subtitle2, write a temp ASS file, and retry.
+                        // This handles formats that libass/subtitles-filter doesn't open
+                        // directly (e.g. MOV_TEXT in MP4, unusual codec wrappings).
                         avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                        buffersrc_ctx = nullptr; buffersink_ctx = nullptr;
+
+                        // --- decode all subtitle events from the stream ---
+                        {
+                            AVCodecID sub_cid2 = in_fmt_ctx->streams[subtitle_stream_index]->codecpar->codec_id;
+                            const AVCodec* sub_codec2 = avcodec_find_decoder(sub_cid2);
+                            AVCodecContext* sub_dec2 = sub_codec2 ? avcodec_alloc_context3(sub_codec2) : nullptr;
+                            if (sub_dec2) {
+                                avcodec_parameters_to_context(sub_dec2, in_fmt_ctx->streams[subtitle_stream_index]->codecpar);
+                                if (avcodec_open2(sub_dec2, sub_codec2, nullptr) >= 0) {
+                                    AVFormatContext* sub_fmt2 = nullptr;
+                                    if (avformat_open_input(&sub_fmt2, in_filename, nullptr, nullptr) >= 0 &&
+                                        avformat_find_stream_info(sub_fmt2, nullptr) >= 0) {
+                                        AVPacket* sub_pkt2 = av_packet_alloc();
+                                        while (sub_pkt2 && av_read_frame(sub_fmt2, sub_pkt2) >= 0) {
+                                            if (sub_pkt2->stream_index == subtitle_stream_index) {
+                                                AVSubtitle sub2 = {};
+                                                int got2 = 0;
+                                                avcodec_decode_subtitle2(sub_dec2, &sub2, &got2, sub_pkt2);
+                                                if (got2) {
+                                                    double s2_start = (sub2.pts != AV_NOPTS_VALUE)
+                                                        ? sub2.pts * 1e-6
+                                                        : sub_pkt2->pts * av_q2d(sub_fmt2->streams[subtitle_stream_index]->time_base);
+                                                    double s2_end = s2_start + sub2.end_display_time * 1e-3;
+                                                    for (unsigned ri = 0; ri < sub2.num_rects; ri++) {
+                                                        AVSubtitleRect* r2 = sub2.rects[ri];
+                                                        std::string txt2;
+                                                        if (r2->type == SUBTITLE_ASS && r2->ass) {
+                                                            // Full Dialogue line: skip first 9 commas to get Text field
+                                                            const char* p2 = r2->ass;
+                                                            for (int nc = 0; *p2 && nc < 9; p2++) if (*p2 == ',') nc++;
+                                                            txt2 = p2;
+                                                        } else if (r2->type == SUBTITLE_TEXT && r2->text) {
+                                                            for (const char* p2 = r2->text; *p2; p2++) {
+                                                                if      (*p2 == '{')  txt2 += "\\{";
+                                                                else if (*p2 == '\n') txt2 += "\\N";
+                                                                else if (*p2 != '\r') txt2 += *p2;
+                                                            }
+                                                        }
+                                                        if (!txt2.empty())
+                                                            text_sub_events.push_back({s2_start, s2_end, std::move(txt2)});
+                                                    }
+                                                    avsubtitle_free(&sub2);
+                                                }
+                                            }
+                                            av_packet_unref(sub_pkt2);
+                                        }
+                                        if (sub_pkt2) av_packet_free(&sub_pkt2);
+                                        avformat_close_input(&sub_fmt2);
+                                    }
+                                }
+                                avcodec_free_context(&sub_dec2);
+                            }
+                        }
+
+                        // --- write temp ASS file and retry the filter ---
+                        if (!text_sub_events.empty()) {
+                            char tmp_dir[MAX_PATH] = {};
+                            GetTempPathA(MAX_PATH, tmp_dir);
+                            GetTempFileNameA(tmp_dir, "sub", 0, temp_ass_path);
+                            FILE* fass = nullptr; fopen_s(&fass, temp_ass_path, "w");
+                            if (fass) {
+                                int fsz = max(12, enc_ctx->height / 18);
+                                fprintf(fass,
+                                    "[Script Info]\r\nScriptType: v4.00+\r\n"
+                                    "PlayResX: %d\r\nPlayResY: %d\r\nWrapStyle: 0\r\n\r\n",
+                                    enc_ctx->width, enc_ctx->height);
+                                fprintf(fass,
+                                    "[V4+ Styles]\r\n"
+                                    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,"
+                                    " OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,"
+                                    " ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow,"
+                                    " Alignment, MarginL, MarginR, MarginV, Encoding\r\n"
+                                    "Style: Default,Arial,%d,&H00FFFFFF,&H000000FF,&H00000000,"
+                                    "&H80000000,-1,0,0,0,100,100,0,0,1,2,0,2,10,10,%d,1\r\n\r\n",
+                                    fsz, fsz);
+                                fprintf(fass,
+                                    "[Events]\r\n"
+                                    "Format: Layer, Start, End, Style, Name,"
+                                    " MarginL, MarginR, MarginV, Effect, Text\r\n");
+                                auto ass_t = [](char* buf, size_t len, double t) {
+                                    if (t < 0) t = 0;
+                                    int h  = (int)(t / 3600);
+                                    int m  = (int)(t / 60) % 60;
+                                    int s  = (int)t % 60;
+                                    int cs = (int)((t - (int)t) * 100);
+                                    snprintf(buf, len, "%d:%02d:%02d.%02d", h, m, s, cs);
+                                };
+                                for (const auto& ev : text_sub_events) {
+                                    char ts[24], te[24];
+                                    ass_t(ts, sizeof(ts), ev.start_s);
+                                    ass_t(te, sizeof(te), ev.end_s);
+                                    fprintf(fass, "Dialogue: 0,%s,%s,Default,,0,0,0,,%s\r\n",
+                                        ts, te, ev.ass_text.c_str());
+                                }
+                                fclose(fass);
+
+                                // Retry filter graph with the temp ASS file (no stream-index needed)
+                                const AVFilter* bsrc2  = avfilter_get_by_name("buffer");
+                                const AVFilter* bsink2 = avfilter_get_by_name("buffersink");
+                                filter_graph = (bsrc2 && bsink2) ? avfilter_graph_alloc() : nullptr;
+                                if (filter_graph) {
+                                    int r2 = avfilter_graph_create_filter(&buffersrc_ctx,  bsrc2,  "in",  src_args, nullptr, filter_graph);
+                                    if (r2 >= 0)
+                                        r2  = avfilter_graph_create_filter(&buffersink_ctx, bsink2, "out", nullptr,  nullptr, filter_graph);
+                                    if (r2 >= 0) {
+                                        // Escape temp path (backslashes → forward slashes)
+                                        char esc2[MAX_PATH * 2]; int k2 = 0;
+                                        for (int j2 = 0; temp_ass_path[j2] && k2 < (int)sizeof(esc2)-2; j2++) {
+                                            char c2 = temp_ass_path[j2];
+                                            esc2[k2++] = (c2 == '\\') ? '/' : c2;
+                                        }
+                                        esc2[k2] = '\0';
+                                        char filt2[MAX_PATH * 2 + 64];
+                                        snprintf(filt2, sizeof(filt2), "subtitles='%s'", esc2);
+                                        AVFilterInOut* o2 = avfilter_inout_alloc();
+                                        AVFilterInOut* i2 = avfilter_inout_alloc();
+                                        if (o2 && i2) {
+                                            o2->name = av_strdup("in");  o2->filter_ctx = buffersrc_ctx;  o2->pad_idx = 0; o2->next = nullptr;
+                                            i2->name = av_strdup("out"); i2->filter_ctx = buffersink_ctx; i2->pad_idx = 0; i2->next = nullptr;
+                                            r2 = avfilter_graph_parse_ptr(filter_graph, filt2, &i2, &o2, nullptr);
+                                            if (r2 >= 0) r2 = avfilter_graph_config(filter_graph, nullptr);
+                                        }
+                                        avfilter_inout_free(&o2);
+                                        avfilter_inout_free(&i2);
+                                        if (r2 >= 0) {
+                                            use_filter = true;
+                                        } else {
+                                            avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                                            buffersrc_ctx = nullptr; buffersink_ctx = nullptr;
+                                        }
+                                    } else {
+                                        avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!use_filter) {
+                            MessageBoxA(nullptr,
+                                "Subtitle burn-in failed: the subtitles filter could not be\n"
+                                "initialised and the pre-decoded fallback also failed.\n\n"
+                                "Check that your FFmpeg build includes libass.",
+                                "Subtitle Error", MB_OK | MB_ICONWARNING);
+                        }
                     }
                 } else {
                     avfilter_graph_free(&filter_graph); filter_graph = nullptr;
@@ -3416,6 +3709,7 @@ flush_encoder:
     success = true;
 
 cleanup:
+    if (temp_ass_path[0]) DeleteFileA(temp_ass_path);
     if (filter_graph) avfilter_graph_free(&filter_graph);
     if (sws_ctx) sws_freeContext(sws_ctx);
     if (sws_hdr2rgb) sws_freeContext(sws_hdr2rgb);
