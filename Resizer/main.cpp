@@ -22,6 +22,7 @@
 #include <uxtheme.h>
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "msimg32.lib")
 #include <windowsx.h>
 #include <io.h>
 #include <fcntl.h>
@@ -34,6 +35,7 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
@@ -72,6 +74,8 @@ extern "C" {
 #define IDC_BTN_BACK              2004
 #define IDC_BTN_MARKIN            2005
 #define IDC_BTN_MARKOUT           2006
+#define IDC_BTN_GOTO_MARKIN       2007
+#define IDC_BTN_GOTO_MARKOUT      2008
 
 #define IDT_UI_REFRESH            3001
 #define IDT_ENCODE_PROGRESS       3002
@@ -139,6 +143,10 @@ static HWND     g_hBtnFwd = nullptr;
 static HWND     g_hBtnBack = nullptr;
 static HWND     g_hBtnMarkIn = nullptr;
 static HWND     g_hBtnMarkOut = nullptr;
+static HWND     g_hBtnGotoMarkIn  = nullptr;
+static HWND     g_hBtnGotoMarkOut = nullptr;
+static int64_t  g_markInMs  = -1;   // -1 = not set
+static int64_t  g_markOutMs = -1;
 
 static HWND     g_hGrpSettings   = nullptr;
 static HWND     g_hGrpRange      = nullptr;
@@ -207,6 +215,7 @@ static int      g_frameHeight = 0;
 
 static HANDLE   g_hPlaybackThread = nullptr;
 static CRITICAL_SECTION g_csState;
+static CRITICAL_SECTION g_csMarkCache;
 static volatile bool g_playThreadShouldExit = false;
 static volatile bool g_isPlaying = false;
 static volatile bool g_seekRequested = false;
@@ -215,9 +224,10 @@ static volatile int64_t g_currentPosMs = 0;
 static volatile bool g_decodeSingleFrame = false;
 static double   g_videoFPS = 30.0;
 static bool     g_playerReady = false;
-static volatile int g_stepDir = 0; // +1 forward, -1 backward
-static bool         g_isDragging   = false; // true while user drags the seekbar thumb
-static bool         g_isGenerating = false; // true while a seek-frame decode is in flight
+static volatile int  g_stepDir = 0; // +1 forward, -1 backward
+static volatile bool g_stepFileReady = false; // thread file ptr is right after last step-decoded frame
+static bool          g_isDragging   = false; // true while user drags the seekbar thumb
+static bool          g_isGenerating = false; // true while a seek-frame decode is in flight
 
 // Forward declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -246,6 +256,8 @@ void StopPlayback();
 void TogglePlayPause(HWND hwnd);
 void EnsureThreadRunningPaused(HWND hwnd);
 void SeekMs(int64_t ms, bool decodeSingle);
+static bool IsXvidAvi(const char* filepath);
+static bool RemuxXvidToMp4(const char* in_path, const char* out_path);
 void StepForward(HWND hwnd);
 void StepBackward(HWND hwnd);
 void UpdateSeekbarFromPos();
@@ -423,11 +435,15 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     {
         int ix    = M + P, iy = y + GH;
         int avail = totalW - P * 2;
-        MoveWindow(g_hBtnPlayPause, ix,                       iy, btnW, btnH, TRUE);
-        MoveWindow(g_hBtnBack,      ix + btnW + 6,            iy, btnW, btnH, TRUE);
-        MoveWindow(g_hBtnFwd,       ix + (btnW + 6) * 2,      iy, btnW, btnH, TRUE);
-        MoveWindow(g_hBtnMarkIn,    ix + (btnW + 6) * 3 + 16, iy, btnW, btnH, TRUE);
-        MoveWindow(g_hBtnMarkOut,   ix + (btnW + 6) * 4 + 16, iy, btnW, btnH, TRUE);
+        const int gotoW = 38;
+        int bx = ix;
+        MoveWindow(g_hBtnPlayPause,   bx, iy, btnW,  btnH, TRUE); bx += btnW + 6;
+        MoveWindow(g_hBtnBack,        bx, iy, btnW,  btnH, TRUE); bx += btnW + 6;
+        MoveWindow(g_hBtnFwd,         bx, iy, btnW,  btnH, TRUE); bx += btnW + 22;
+        MoveWindow(g_hBtnMarkIn,      bx, iy, btnW,  btnH, TRUE); bx += btnW + 4;
+        MoveWindow(g_hBtnGotoMarkIn,  bx, iy, gotoW, btnH, TRUE); bx += gotoW + 10;
+        MoveWindow(g_hBtnMarkOut,     bx, iy, btnW,  btnH, TRUE); bx += btnW + 4;
+        MoveWindow(g_hBtnGotoMarkOut, bx, iy, gotoW, btnH, TRUE);
         iy += btnH + 6;
         MoveWindow(g_hTimeline, ix, iy, avail, seekH, TRUE);
     }
@@ -488,6 +504,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     ApplyTheme(g_mainHwnd);   // sets colours and dark title bar before first paint
     InitializeCriticalSection(&g_csState);
+    InitializeCriticalSection(&g_csMarkCache);
 
     ShowWindow(g_mainHwnd, nCmdShow);
     UpdateWindow(g_mainHwnd);
@@ -499,6 +516,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     DeleteCriticalSection(&g_csState);
+    DeleteCriticalSection(&g_csMarkCache);
     if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CoUninitialize();
     return (int)msg.wParam;
@@ -832,6 +850,32 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
         g.DrawLine(&pen, cx + 9.0f, cy - 8.0f, cx + 4.5f, cy - 8.0f);
         g.DrawLine(&pen, cx + 9.0f, cy + 8.0f, cx + 4.5f, cy + 8.0f);
     }
+    else if (id == IDC_BTN_GOTO_MARKIN) {
+        // ←| jump to mark-in: left-pointing arrow → vertical bar (violet)
+        Gdiplus::Color col(a, 155, 95, 255);
+        Gdiplus::SolidBrush b(col);
+        Gdiplus::Pen pen(col, 2.5f);
+        pen.SetStartCap(Gdiplus::LineCapSquare);
+        pen.SetEndCap(Gdiplus::LineCapSquare);
+        // vertical bar on right
+        g.DrawLine(&pen, cx + 7.0f, cy - 8.0f, cx + 7.0f, cy + 8.0f);
+        // left-pointing arrow pointing at the bar
+        Gdiplus::PointF pts[3] = { {cx + 3.0f, cy - 6.0f}, {cx + 3.0f, cy + 6.0f}, {cx - 7.0f, cy} };
+        g.FillPolygon(&b, pts, 3);
+    }
+    else if (id == IDC_BTN_GOTO_MARKOUT) {
+        // |→ jump to mark-out: vertical bar → right-pointing arrow (hot-pink)
+        Gdiplus::Color col(a, 255, 75, 135);
+        Gdiplus::SolidBrush b(col);
+        Gdiplus::Pen pen(col, 2.5f);
+        pen.SetStartCap(Gdiplus::LineCapSquare);
+        pen.SetEndCap(Gdiplus::LineCapSquare);
+        // vertical bar on left
+        g.DrawLine(&pen, cx - 7.0f, cy - 8.0f, cx - 7.0f, cy + 8.0f);
+        // right-pointing arrow pointing away from the bar
+        Gdiplus::PointF pts[3] = { {cx - 3.0f, cy - 6.0f}, {cx - 3.0f, cy + 6.0f}, {cx + 7.0f, cy} };
+        g.FillPolygon(&b, pts, 3);
+    }
     }   // end else (player buttons)
     }   // end Graphics scope — GDI+ content flushed to memDC
 
@@ -1062,6 +1106,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hBtnMarkOut = CreateWindowEx(0, L"BUTTON", L"",
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 430, 250, 90, 26, hwnd,
             (HMENU)IDC_BTN_MARKOUT, GetModuleHandle(nullptr), nullptr);
+        g_hBtnGotoMarkIn = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 530, 250, 38, 26, hwnd,
+            (HMENU)IDC_BTN_GOTO_MARKIN, GetModuleHandle(nullptr), nullptr);
+        g_hBtnGotoMarkOut = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 572, 250, 38, 26, hwnd,
+            (HMENU)IDC_BTN_GOTO_MARKOUT, GetModuleHandle(nullptr), nullptr);
         g_hTimeline = CreateWindowEx(0, L"ResizerTimeline", L"",
             WS_CHILD | WS_VISIBLE,
             10, 285, 600, 72, hwnd, (HMENU)IDC_SEEKBAR, GetModuleHandle(nullptr), nullptr);
@@ -1105,6 +1155,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             applyLabelFont(g_hSubsStatic);     applyFont(g_hSubsDrop);
             applyFont(g_hBtnPlayPause);   applyFont(g_hBtnBack);
             applyFont(g_hBtnFwd);         applyFont(g_hBtnMarkIn);   applyFont(g_hBtnMarkOut);
+            applyFont(g_hBtnGotoMarkIn);  applyFont(g_hBtnGotoMarkOut);
             applyFont(g_hGrpSaveLoc);
             applyLabelFont(g_hSaveSameRadio);  applyLabelFont(g_hSaveCustomRadio);
             applyFont(g_hSavePathEdit);        applyFont(g_hSaveBrowseBtn);
@@ -1137,8 +1188,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         addTip(g_hBtnPlayPause,  L"Play / Pause  [Space]");
         addTip(g_hBtnBack,      L"Step back one frame  [\u2190]");
         addTip(g_hBtnFwd,       L"Step forward one frame  [\u2192]");
-        addTip(g_hBtnMarkIn,    L"Set clip start to current position  [I]");
-        addTip(g_hBtnMarkOut,   L"Set clip end to current position  [O]");
+        addTip(g_hBtnMarkIn,       L"Set clip start to current position  [I]");
+        addTip(g_hBtnMarkOut,      L"Set clip end to current position  [O]");
+        addTip(g_hBtnGotoMarkIn,   L"Jump playhead to mark-in position");
+        addTip(g_hBtnGotoMarkOut,  L"Jump playhead to mark-out position");
 
         // Try to initialise CUDA device for NVDEC hardware decoding.
         TryInitHWDevice();
@@ -1301,6 +1354,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_tlMax = (int)(g_duration * 1000);
                 g_tlPos = 0;
                 g_tlEnabled = true;
+                g_markInMs  = -1;
+                g_markOutMs = -1;
                 InvalidateRect(g_hTimeline, nullptr, TRUE);
 
                 EnableWindow(g_hBtnPlayPause, TRUE);
@@ -1308,6 +1363,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(g_hBtnBack, TRUE);
                 EnableWindow(g_hBtnMarkIn, TRUE);
                 EnableWindow(g_hBtnMarkOut, TRUE);
+                EnableWindow(g_hBtnGotoMarkIn,  FALSE);
+                EnableWindow(g_hBtnGotoMarkOut, FALSE);
                 InvalidateRect(g_hBtnPlayPause, nullptr, TRUE);
 
                 // Start thumbnail extraction in background
@@ -1335,6 +1392,66 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_currentPosMs = 0;
                 g_playerReady = true;
                 InvalidateRect(hwnd, nullptr, TRUE);
+
+                // Detect Xvid/MPEG-4 packed B-frames in AVI — these carry stale VOP
+                // timestamps from wherever the clip was cut, making position display
+                // wildly wrong (e.g. showing 11133 s for a 7420 s file).
+                if (IsXvidAvi(g_inputPath)) {
+                    int ans = MessageBoxW(hwnd,
+                        L"This file is an Xvid/MPEG-4 AVI with packed B-frames.\n\n"
+                        L"B-frame timestamps are stored relative to the original recording\n"
+                        L"rather than the clip, which corrupts the position display and\n"
+                        L"makes in/out point selection unusable.\n\n"
+                        L"Would you like to create a corrected MP4 copy?\n"
+                        L"This is a fast one-time stream copy \x2014 no re-encoding.",
+                        L"Packed B-Frame Timestamps",
+                        MB_YESNO | MB_ICONINFORMATION);
+                    if (ans == IDYES) {
+                        // Build output path: same dir, .mp4 extension.
+                        char out_path[MAX_PATH];
+                        strcpy_s(out_path, g_inputPath);
+                        char* ext = strrchr(out_path, '.');
+                        if (ext) *ext = '\0';
+                        strcat_s(out_path, ".mp4");
+                        // If the .mp4 already exists use _fixed.mp4
+                        if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES) {
+                            strcpy_s(out_path, g_inputPath);
+                            char* ext2 = strrchr(out_path, '.');
+                            if (ext2) *ext2 = '\0';
+                            strcat_s(out_path, "_fixed.mp4");
+                        }
+
+                        HCURSOR hWait = LoadCursor(nullptr, IDC_WAIT);
+                        HCURSOR hPrev = SetCursor(hWait);
+                        bool remux_ok = RemuxXvidToMp4(g_inputPath, out_path);
+                        SetCursor(hPrev);
+
+                        if (remux_ok) {
+                            wchar_t msg[MAX_PATH + 128];
+                            StringCchPrintfW(msg, ARRAYSIZE(msg),
+                                L"Done.\n\nFixed file: %S\n\nLoad the new file now?", out_path);
+                            if (MessageBoxW(hwnd, msg, L"Remux Complete", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+                                strcpy_s(g_inputPath, out_path);
+                                // Reload info for the new file and fall through to normal init.
+                                GetVideoInfo(g_inputPath, g_vidWidth, g_vidHeight, g_duration);
+                                g_tlMax = (int)(g_duration * 1000);
+                                InvalidateRect(hwnd, nullptr, TRUE);
+                                if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
+                                g_hFrameBitmap = ExtractMiddleFrameBitmap(g_inputPath, g_vidWidth, g_vidHeight, g_duration);
+                                if (g_hFrameBitmap) {
+                                    BITMAP bi2; GetObject(g_hFrameBitmap, sizeof(bi2), &bi2);
+                                    g_frameWidth = bi2.bmWidth; g_frameHeight = bi2.bmHeight;
+                                }
+                            }
+                        } else {
+                            MessageBoxW(hwnd,
+                                L"Remux failed. The file may be in use or the destination\n"
+                                L"path is not writable.", L"Remux Failed", MB_ICONERROR);
+                            if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES)
+                                DeleteFileA(out_path); // remove partial output
+                        }
+                    }
+                }
             }
             else {
                 MessageBox(hwnd, L"Failed to retrieve video information.", L"Error", MB_ICONERROR);
@@ -1578,6 +1695,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == IDC_BTN_MARKOUT && g_playerReady) {
             SetMarkOutFromCurrent(hwnd);
         }
+        else if (id == IDC_BTN_GOTO_MARKIN && g_playerReady && g_markInMs >= 0) {
+            g_tlPos = (int)g_markInMs;
+            InvalidateRect(g_hTimeline, nullptr, FALSE);
+            g_isGenerating = true;
+            EnsureThreadRunningPaused(hwnd);
+            SeekMs(g_markInMs, !g_isPlaying);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (id == IDC_BTN_GOTO_MARKOUT && g_playerReady && g_markOutMs >= 0) {
+            g_tlPos = (int)g_markOutMs;
+            InvalidateRect(g_hTimeline, nullptr, FALSE);
+            g_isGenerating = true;
+            EnsureThreadRunningPaused(hwnd);
+            SeekMs(g_markOutMs, !g_isPlaying);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         break;
     }
 
@@ -1815,6 +1948,116 @@ static void PopulateAudioAndSubsDropdowns(const char* filepath) {
     }
     SendMessage(g_hAudioDrop, CB_SETCURSEL, 0, 0);
     SendMessage(g_hSubsDrop,  CB_SETCURSEL, 0, 0);
+}
+
+// ------------------------------ Xvid/packed-B-frame detection & remux ------------------------------
+
+// Returns true if the file is MPEG-4 video inside an AVI container — the condition
+// that produces packed B-frames with stale VOP timestamps.
+static bool IsXvidAvi(const char* filepath) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, filepath, nullptr, nullptr) < 0) return false;
+    if (avformat_find_stream_info(fmt, nullptr) < 0) { avformat_close_input(&fmt); return false; }
+    bool result = false;
+    if (fmt->iformat && strstr(fmt->iformat->name, "avi")) {
+        for (unsigned i = 0; i < fmt->nb_streams; i++) {
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                fmt->streams[i]->codecpar->codec_id  == AV_CODEC_ID_MPEG4) {
+                result = true; break;
+            }
+        }
+    }
+    avformat_close_input(&fmt);
+    return result;
+}
+
+// Stream-copy the AVI to an MP4, applying mpeg4_unpack_bframes to the video
+// so every frame gets a proper container-level DTS.  Returns true on success.
+static bool RemuxXvidToMp4(const char* in_path, const char* out_path) {
+    AVFormatContext* in_fmt  = nullptr;
+    AVFormatContext* out_fmt = nullptr;
+    AVPacket*        pkt     = av_packet_alloc();
+    AVPacket*        bpkt    = av_packet_alloc();
+    AVBSFContext*    bsf     = nullptr;
+    bool             ok      = false;
+    int              vid_idx = -1;
+
+    if (!pkt || !bpkt) goto done;
+    if (avformat_open_input(&in_fmt, in_path, nullptr, nullptr) < 0) goto done;
+    if (avformat_find_stream_info(in_fmt, nullptr) < 0) goto done;
+    if (avformat_alloc_output_context2(&out_fmt, nullptr, nullptr, out_path) < 0) goto done;
+
+    // Map every input stream to the output and find the MPEG-4 video stream.
+    for (unsigned i = 0; i < in_fmt->nb_streams; i++) {
+        AVStream* is = in_fmt->streams[i];
+        AVStream* os = avformat_new_stream(out_fmt, nullptr);
+        if (!os) goto done;
+        if (avcodec_parameters_copy(os->codecpar, is->codecpar) < 0) goto done;
+        os->codecpar->codec_tag = 0; // let the muxer assign the correct tag
+        os->time_base = is->time_base;
+        if (is->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            is->codecpar->codec_id   == AV_CODEC_ID_MPEG4  && vid_idx < 0) {
+            vid_idx = (int)i;
+        }
+    }
+
+    // Set up mpeg4_unpack_bframes BSF on the video stream.
+    if (vid_idx >= 0) {
+        const AVBitStreamFilter* f = av_bsf_get_by_name("mpeg4_unpack_bframes");
+        if (f && av_bsf_alloc(f, &bsf) >= 0) {
+            avcodec_parameters_copy(bsf->par_in, in_fmt->streams[vid_idx]->codecpar);
+            bsf->time_base_in = in_fmt->streams[vid_idx]->time_base;
+            if (av_bsf_init(bsf) < 0) { av_bsf_free(&bsf); bsf = nullptr; }
+        }
+    }
+
+    if (!(out_fmt->oformat->flags & AVFMT_NOFILE))
+        if (avio_open(&out_fmt->pb, out_path, AVIO_FLAG_WRITE) < 0) goto done;
+    if (avformat_write_header(out_fmt, nullptr) < 0) goto done;
+
+    while (av_read_frame(in_fmt, pkt) >= 0) {
+        AVStream* is = in_fmt->streams[pkt->stream_index];
+        AVStream* os = out_fmt->streams[pkt->stream_index];
+
+        if (pkt->stream_index == vid_idx && bsf) {
+            if (av_bsf_send_packet(bsf, pkt) >= 0) {
+                while (av_bsf_receive_packet(bsf, bpkt) >= 0) {
+                    av_packet_rescale_ts(bpkt, bsf->time_base_out, os->time_base);
+                    bpkt->stream_index = vid_idx;
+                    av_interleaved_write_frame(out_fmt, bpkt);
+                    av_packet_unref(bpkt);
+                }
+            }
+            av_packet_unref(pkt);
+        } else {
+            av_packet_rescale_ts(pkt, is->time_base, os->time_base);
+            av_interleaved_write_frame(out_fmt, pkt);
+            av_packet_unref(pkt);
+        }
+    }
+
+    // Flush the BSF.
+    if (bsf) {
+        av_bsf_send_packet(bsf, nullptr);
+        while (av_bsf_receive_packet(bsf, bpkt) >= 0) {
+            av_packet_rescale_ts(bpkt, bsf->time_base_out, out_fmt->streams[vid_idx]->time_base);
+            bpkt->stream_index = vid_idx;
+            av_interleaved_write_frame(out_fmt, bpkt);
+            av_packet_unref(bpkt);
+        }
+    }
+
+    av_write_trailer(out_fmt);
+    ok = true;
+
+done:
+    if (bsf)    av_bsf_free(&bsf);
+    if (bpkt)   av_packet_free(&bpkt);
+    if (pkt)    av_packet_free(&pkt);
+    if (out_fmt && !(out_fmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_fmt->pb);
+    if (out_fmt) avformat_free_context(out_fmt);
+    if (in_fmt)  avformat_close_input(&in_fmt);
+    return ok;
 }
 
 // ------------------------------ Video Info ------------------------------
@@ -2170,6 +2413,8 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
     int64_t   t0PtsMs        = 0;
     bool      prevWasPlaying = false; // initialised below after audio init
     int64_t   catchUpToMs    = -1;   // skip frames before this PTS after a seek
+    int64_t   vid_play_start = 0;    // stream->start_time offset (AVI/Xvid may be non-zero)
+    int64_t   last_vid_dts   = AV_NOPTS_VALUE; // most-recent valid video packet DTS
 
     bool init_ok = false;
     do {
@@ -2180,6 +2425,10 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
         }
         if (videoStreamIndex < 0) break;
         videoStream = fmt_ctx->streams[videoStreamIndex];
+        // AVI/Xvid: stream->start_time can be non-zero; subtract it from all PTS values
+        // so that elapsed time is always measured from the actual start of the file.
+        vid_play_start = (videoStream->start_time != AV_NOPTS_VALUE)
+                          ? videoStream->start_time : 0;
 
         decoder = find_best_decoder(videoStream->codecpar->codec_id, using_hw);
         if (!decoder) break;
@@ -2191,6 +2440,11 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             dec_ctx->get_format    = get_hw_format;
         }
         if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) break;
+
+        // bsf_ctx / bsf_pkt intentionally not used in playback: the mpeg4_unpack_bframes
+        // BSF reorders packets in a way that sends B-frames to the decoder before their
+        // reference P-frames, causing progressive quality degradation every GOP (~3 s).
+        // Wrong VOP timestamps are handled instead by the last_vid_dts fallback below.
 
         // sws_ctx is created lazily on the first frame so we get the real pixel
         // format after NVDEC hw→cpu transfer (dec_ctx->pix_fmt == CUDA with hw).
@@ -2270,7 +2524,12 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
     prevWasPlaying = g_isPlaying; // avoid spurious pause/resume transition on first tick
 
     auto doSeek = [&](int64_t toMs) {
-        int64_t ts = av_rescale_q(toMs, AVRational{ 1,1000 }, videoStream->time_base);
+        g_stepFileReady = false;
+        // Add vid_play_start so the seek target is an absolute stream PTS, not a
+        // relative offset.  Without this, files with non-zero start_time (e.g. MP4s
+        // produced by h264_nvenc) seek slightly before the intended position.
+        int64_t ts = av_rescale_q(toMs, AVRational{ 1,1000 }, videoStream->time_base)
+                     + vid_play_start;
         av_seek_frame(fmt_ctx, videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(dec_ctx);
         };
@@ -2322,6 +2581,7 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
 
             while (av_read_frame(fmt_ctx, pkt) >= 0) {
                 if (pkt->stream_index != videoStreamIndex) { av_packet_unref(pkt); continue; }
+                if (pkt->dts != AV_NOPTS_VALUE) last_vid_dts = pkt->dts;
                 if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
 
                 while (avcodec_receive_frame(dec_ctx, frame) == 0) {
@@ -2373,8 +2633,21 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                         }
                     }
 
-                    int64_t ms = (int64_t)(frame->best_effort_timestamp *
+                    int64_t raw_pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                          ? frame->best_effort_timestamp
+                                          : (frame->pts != AV_NOPTS_VALUE ? frame->pts : vid_play_start);
+                    int64_t ms = (int64_t)((raw_pts - vid_play_start) *
                         av_q2d(videoStream->time_base) * 1000.0);
+                    // If the codec returned a stale VOP timestamp from outside this clip
+                    // (e.g. Xvid cut from a long recording), fall back to the container DTS.
+                    {
+                        int64_t durMs = (int64_t)(g_duration * 1000.0);
+                        if (ms < 0 || ms > durMs + 1000) {
+                            int64_t dts_pts = (last_vid_dts != AV_NOPTS_VALUE) ? last_vid_dts : vid_play_start;
+                            ms = (int64_t)((dts_pts - vid_play_start) * av_q2d(videoStream->time_base) * 1000.0);
+                            ms = (ms < 0) ? 0 : (ms > durMs ? durMs : ms);
+                        }
+                    }
 
                     if (g_stepDir >= 0) {
                         // Forward step: stop at first frame >= target
@@ -2432,13 +2705,15 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             g_decodeSingleFrame = false;
             g_stepDir = 0;
             if (produced) {
+                g_stepFileReady = true; // file ptr is now right after decoded frame — next forward step can skip seek
                 PostMessage(g_mainHwnd, WM_APP_FRAME_READY, 0, 0);
             }
-            Sleep(5);
+            Sleep(2);
             continue;
         }
 
-        if (!g_isPlaying) { Sleep(10); continue; }
+        if (!g_isPlaying) { Sleep(5); continue; }
+        g_stepFileReady = false; // playback advances file position — no longer right after a specific frame
 
         if (av_read_frame(fmt_ctx, pkt) < 0) {
             g_isPlaying = false;
@@ -2490,6 +2765,7 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
             av_packet_unref(pkt);
             continue;
         }
+        if (pkt->dts != AV_NOPTS_VALUE) last_vid_dts = pkt->dts;
         if (avcodec_send_packet(dec_ctx, pkt) < 0) {
             av_packet_unref(pkt);
             continue;
@@ -2503,8 +2779,20 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
                     sw_frame = cpu_frame;
             }
             // Compute PTS early so we can skip frames still before the seek target.
-            int64_t ms = (int64_t)(frame->best_effort_timestamp *
+            int64_t raw_pts2 = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                   ? frame->best_effort_timestamp
+                                   : (frame->pts != AV_NOPTS_VALUE ? frame->pts : vid_play_start);
+            int64_t ms = (int64_t)((raw_pts2 - vid_play_start) *
                 av_q2d(videoStream->time_base) * 1000.0);
+            // Guard against stale VOP timestamps from Xvid clips cut from longer recordings.
+            {
+                int64_t durMs = (int64_t)(g_duration * 1000.0);
+                if (ms < 0 || ms > durMs + 1000) {
+                    int64_t dts_pts = (last_vid_dts != AV_NOPTS_VALUE) ? last_vid_dts : vid_play_start;
+                    ms = (int64_t)((dts_pts - vid_play_start) * av_q2d(videoStream->time_base) * 1000.0);
+                    ms = (ms < 0) ? 0 : (ms > durMs ? durMs : ms);
+                }
+            }
             if (catchUpToMs >= 0 && ms < catchUpToMs) {
                 av_frame_unref(frame);
                 continue;  // discard — still catching up to the seek target
@@ -2679,10 +2967,19 @@ void StepForward(HWND hwnd) {
     g_isPlaying = false;
     int frameMs = (int)max(1.0, 1000.0 / g_videoFPS);
     g_stepDir = +1;
-    int64_t target = g_currentPosMs + frameMs;
-    SeekMs(target, true);
     int64_t durMs = (int64_t)(g_duration * 1000.0);
-    g_tlPos = (int)min(target, durMs);
+    int64_t target = min(g_currentPosMs + frameMs, durMs);
+
+    if (g_stepFileReady) {
+        // Thread file ptr is right after the last decoded frame — skip the costly I-frame seek
+        // and let the thread read the next packet directly (1 frame decode vs entire GOP).
+        g_stepFileReady = false;
+        g_seekTargetMs = target;
+        g_decodeSingleFrame = true;
+    } else {
+        SeekMs(target, true);
+    }
+    g_tlPos = (int)target;
     InvalidateRect(g_hTimeline, nullptr, FALSE);
 }
 
@@ -2690,6 +2987,7 @@ void StepForward(HWND hwnd) {
 void StepBackward(HWND hwnd) {
     EnsureThreadRunningPaused(hwnd);
     g_isPlaying = false;
+    g_stepFileReady = false;
     int frameMs = (int)max(1.0, 1000.0 / g_videoFPS);
     g_stepDir = -1;
     // Seek slightly earlier than one frame to ensure we land before target and then walk forward
@@ -2719,6 +3017,9 @@ void SetMarkInFromCurrent(HWND hwnd) {
     double secs = g_currentPosMs / 1000.0;
     wchar_t buf[32]; StringCchPrintfW(buf, 32, L"%.3f", secs);
     SetWindowTextW(g_hStartEdit, buf);
+    g_markInMs = (int64_t)g_currentPosMs;
+    EnableWindow(g_hBtnGotoMarkIn, TRUE);
+    InvalidateRect(g_hTimeline, nullptr, FALSE);
 }
 
 void SetMarkOutFromCurrent(HWND hwnd) {
@@ -2732,6 +3033,9 @@ void SetMarkOutFromCurrent(HWND hwnd) {
     double secs = g_currentPosMs / 1000.0;
     wchar_t buf[32]; StringCchPrintfW(buf, 32, L"%.3f", secs);
     SetWindowTextW(g_hEndEdit, buf);
+    g_markOutMs = (int64_t)g_currentPosMs;
+    EnableWindow(g_hBtnGotoMarkOut, TRUE);
+    InvalidateRect(g_hTimeline, nullptr, FALSE);
 }
 
 // ------------------------------ Transcode (unchanged) ------------------------------
@@ -2775,7 +3079,6 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     int               pgs_plane_h      = 0;
     std::vector<PgsEvent>    pgs_events;
     std::vector<TextSubEvent> text_sub_events;
-    char                     temp_ass_path[MAX_PATH] = {};  // temp ASS file for subtitle fallback
     int               videoStreamIndex = -1;
     int               audioStreamIndex = -1;
     AVFrame*          frame            = nullptr;
@@ -2787,6 +3090,11 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     bool              using_hw         = false;
     int64_t           video_start_pts  = 0;
     int64_t           audio_start_pts  = 0;
+    int64_t           vid_stream_start = 0;  // stream->start_time for video (AVI/Xvid offset)
+    int64_t           aud_stream_start = 0;  // stream->start_time for audio
+    int64_t           last_vid_pkt_dts = AV_NOPTS_VALUE; // most-recent valid video packet DTS
+    AVBSFContext*     trans_bsf_ctx    = nullptr; // mpeg4_unpack_bframes for packed-B AVIs
+    AVPacket*         trans_bsf_pkt    = nullptr;
     AVCodecContext*   aDec_ctx         = nullptr;
     AVCodecContext*   aEnc_ctx         = nullptr;
     SwrContext*       aSwrCtx          = nullptr;
@@ -2815,6 +3123,14 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     video_in_stream = in_fmt_ctx->streams[videoStreamIndex];
     if (audioStreamIndex >= 0) audio_in_stream = in_fmt_ctx->streams[audioStreamIndex];
 
+    // Stream start_time offsets: AVI/Xvid (and some other containers) can have a
+    // non-zero start_time so that the first frame's PTS is not 0.  All timestamp
+    // arithmetic must subtract this offset to get elapsed-seconds-from-file-start.
+    vid_stream_start = (video_in_stream->start_time != AV_NOPTS_VALUE)
+                        ? video_in_stream->start_time : 0;
+    aud_stream_start = (audio_in_stream && audio_in_stream->start_time != AV_NOPTS_VALUE)
+                        ? audio_in_stream->start_time : 0;
+
     // Bitrate calculation: subtract audio and a safety margin so the encoder's CBR
     // overshoot and container overhead never push the file over the target size.
     // 5% overhead absorbs: ~1-2% MP4 container (moov/stbl index tables) + 3-4%
@@ -2841,6 +3157,19 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     }
     if (avcodec_open2(dec_ctx, video_decoder, nullptr) < 0) { OutputDebugStringA("Failed to open video decoder.\n"); goto cleanup; }
 
+    // Apply mpeg4_unpack_bframes BSF for packed-B-frame Xvid/DivX AVIs.
+    if (video_in_stream->codecpar->codec_id == AV_CODEC_ID_MPEG4) {
+        const AVBitStreamFilter* tbsf = av_bsf_get_by_name("mpeg4_unpack_bframes");
+        if (tbsf && av_bsf_alloc(tbsf, &trans_bsf_ctx) >= 0) {
+            avcodec_parameters_copy(trans_bsf_ctx->par_in, video_in_stream->codecpar);
+            trans_bsf_ctx->time_base_in = video_in_stream->time_base;
+            if (av_bsf_init(trans_bsf_ctx) < 0) {
+                av_bsf_free(&trans_bsf_ctx); trans_bsf_ctx = nullptr;
+            }
+        }
+    }
+    trans_bsf_pkt = trans_bsf_ctx ? av_packet_alloc() : nullptr;
+
     avformat_alloc_output_context2(&out_fmt_ctx, nullptr, nullptr, out_filename);
     if (!out_fmt_ctx) { OutputDebugStringA("Could not create output format context.\n"); goto cleanup; }
 
@@ -2864,6 +3193,10 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         // across all NVENC driver versions; cbr can overshoot by 3-8% on
         // complex content because the driver-side rate controller isn't HRD-exact.
         av_opt_set(enc_ctx->priv_data, "rc", "vbr", 0);
+        // h264_nvenc ignores enc_ctx->max_b_frames; force B-frames off via its own option.
+        // Without this the encoder adds a ~3-frame DTS offset that shifts the output
+        // video start by ~0.1 s relative to the input, causing AV/timestamp drift.
+        av_opt_set(enc_ctx->priv_data, "bf", "0", 0);
     } else {
         av_opt_set(enc_ctx->priv_data, "preset",  "medium", 0);
         av_opt_set(enc_ctx->priv_data, "nal-hrd", "cbr",    0);
@@ -2966,9 +3299,10 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
 
     {
         AVRational video_tb = video_in_stream->time_base;
-        // Convert start_seconds (in AV_TIME_BASE) to the video stream's time_base.
+        // Convert start_seconds to stream PTS, accounting for the stream's own start_time
+        // offset so that seeking and rel-PTS rebasing both work correctly for AVI/Xvid.
         int64_t start_av = (int64_t)llround(start_seconds * AV_TIME_BASE);
-        video_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, video_tb);
+        video_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, video_tb) + vid_stream_start;
 
         // Seek the demuxer to (or just before) the requested start on the video stream.
         if (av_seek_frame(in_fmt_ctx, videoStreamIndex, video_start_pts, AVSEEK_FLAG_BACKWARD) < 0) {
@@ -2978,7 +3312,7 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         // Prepare audio timeline anchor too (if present).
         if (audio_in_stream) {
             AVRational audio_tb = audio_in_stream->time_base;
-            audio_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, audio_tb);
+            audio_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, audio_tb) + aud_stream_start;
         }
     }
     avcodec_flush_buffers(dec_ctx);
@@ -3175,14 +3509,195 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     if (ret >= 0) {
                         use_filter = true;
                     } else {
-                        char errbuf[256]; av_strerror(ret, errbuf, sizeof(errbuf));
-                        char msg[MAX_PATH * 2 + 512];
-                        snprintf(msg, sizeof(msg),
-                            "External subtitle filter failed.\n\nFile: %s\nError: %s",
-                            ext_subtitle_path, errbuf);
-                        MessageBoxA(nullptr, msg, "Subtitle Error", MB_OK | MB_ICONWARNING);
+                        // subtitles filter failed (likely no libass) — open the external
+                        // subtitle file with avformat, decode events, and render via GDI.
                         avfilter_graph_free(&filter_graph); filter_graph = nullptr;
                         buffersrc_ctx = nullptr; buffersink_ctx = nullptr;
+
+                        AVFormatContext* ext_fmt = nullptr;
+                        if (avformat_open_input(&ext_fmt, ext_subtitle_path, nullptr, nullptr) >= 0 &&
+                            avformat_find_stream_info(ext_fmt, nullptr) >= 0) {
+                            int ext_sub_idx = -1;
+                            for (unsigned si = 0; si < ext_fmt->nb_streams; si++) {
+                                if (ext_fmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+                                    ext_sub_idx = (int)si; break;
+                                }
+                            }
+                            if (ext_sub_idx >= 0) {
+                                AVCodecID ext_cid = ext_fmt->streams[ext_sub_idx]->codecpar->codec_id;
+                                const AVCodec* ext_codec = avcodec_find_decoder(ext_cid);
+                                AVCodecContext* ext_dec = ext_codec ? avcodec_alloc_context3(ext_codec) : nullptr;
+                                if (ext_dec) {
+                                    avcodec_parameters_to_context(ext_dec, ext_fmt->streams[ext_sub_idx]->codecpar);
+                                    if (avcodec_open2(ext_dec, ext_codec, nullptr) >= 0) {
+                                        AVPacket* ext_pkt = av_packet_alloc();
+                                        while (ext_pkt && av_read_frame(ext_fmt, ext_pkt) >= 0) {
+                                            if (ext_pkt->stream_index == ext_sub_idx) {
+                                                AVSubtitle ext_sub2 = {}; int got2 = 0;
+                                                avcodec_decode_subtitle2(ext_dec, &ext_sub2, &got2, ext_pkt);
+                                                if (got2) {
+                                                    double s2_start = (ext_sub2.pts != AV_NOPTS_VALUE)
+                                                        ? ext_sub2.pts * 1e-6
+                                                        : ext_pkt->pts * av_q2d(ext_fmt->streams[ext_sub_idx]->time_base);
+                                                    double s2_end = s2_start + ext_sub2.end_display_time * 1e-3;
+                                                    for (unsigned ri = 0; ri < ext_sub2.num_rects; ri++) {
+                                                        AVSubtitleRect* r2 = ext_sub2.rects[ri];
+                                                        std::string txt2;
+                                                        if (r2->type == SUBTITLE_ASS && r2->ass) {
+                                                            const char* p2 = r2->ass;
+                                                            for (int nc = 0; *p2 && nc < 9; p2++) if (*p2 == ',') nc++;
+                                                            txt2 = p2;
+                                                        } else if (r2->type == SUBTITLE_TEXT && r2->text) {
+                                                            for (const char* p2 = r2->text; *p2; p2++) {
+                                                                if      (*p2 == '{')  txt2 += "\\{";
+                                                                else if (*p2 == '\n') txt2 += "\\N";
+                                                                else if (*p2 != '\r') txt2 += *p2;
+                                                            }
+                                                        }
+                                                        if (!txt2.empty())
+                                                            text_sub_events.push_back({s2_start, s2_end, std::move(txt2)});
+                                                    }
+                                                    avsubtitle_free(&ext_sub2);
+                                                }
+                                            }
+                                            av_packet_unref(ext_pkt);
+                                        }
+                                        if (ext_pkt) av_packet_free(&ext_pkt);
+                                    }
+                                    avcodec_free_context(&ext_dec);
+                                }
+                            }
+                            avformat_close_input(&ext_fmt);
+                        }
+
+                        // GDI render collected text events into pgs_events.
+                        if (!text_sub_events.empty()) {
+                            int frame_w  = enc_ctx->width;
+                            int frame_h  = enc_ctx->height;
+                            int font_h   = max(14, frame_h / 20);
+                            int margin_v = max(12, frame_h / 18);
+                            int max_tw   = frame_w * 85 / 100;
+                            HDC screen_dc = GetDC(nullptr);
+                            HDC mem_dc    = CreateCompatibleDC(screen_dc);
+                            BITMAPINFO bmi2 = {};
+                            bmi2.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+                            bmi2.bmiHeader.biWidth       = frame_w;
+                            bmi2.bmiHeader.biHeight      = -frame_h;
+                            bmi2.bmiHeader.biPlanes      = 1;
+                            bmi2.bmiHeader.biBitCount    = 32;
+                            bmi2.bmiHeader.biCompression = BI_RGB;
+                            uint32_t* pixels2 = nullptr;
+                            HBITMAP hbm2 = CreateDIBSection(screen_dc, &bmi2, DIB_RGB_COLORS,
+                                                            (void**)&pixels2, nullptr, 0);
+                            ReleaseDC(nullptr, screen_dc);
+                            if (hbm2 && pixels2 && mem_dc) {
+                                HBITMAP old_bm2 = (HBITMAP)SelectObject(mem_dc, hbm2);
+                                HFONT hfont2 = CreateFontA(
+                                    -font_h, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                                HFONT old_font2 = (HFONT)SelectObject(mem_dc, hfont2);
+                                SetBkMode(mem_dc, TRANSPARENT);
+                                auto strip_ass2 = [](const std::string& s) -> std::wstring {
+                                    std::string out;
+                                    bool in_tag = false;
+                                    for (size_t i = 0; i < s.size(); i++) {
+                                        if (s[i] == '{') { in_tag = true;  continue; }
+                                        if (s[i] == '}') { in_tag = false; continue; }
+                                        if (in_tag) continue;
+                                        if (s[i] == '\\' && i + 1 < s.size()) {
+                                            char n = s[i + 1];
+                                            if (n == 'N' || n == 'n') { out += '\n'; i++; continue; }
+                                            if (n == 'h')             { out += ' ';  i++; continue; }
+                                        }
+                                        out += s[i];
+                                    }
+                                    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+                                        out.pop_back();
+                                    int wlen = MultiByteToWideChar(CP_UTF8, 0, out.c_str(), -1, nullptr, 0);
+                                    std::wstring w(wlen, 0);
+                                    MultiByteToWideChar(CP_UTF8, 0, out.c_str(), -1, &w[0], wlen);
+                                    if (!w.empty() && w.back() == 0) w.pop_back();
+                                    return w;
+                                };
+                                const uint32_t MAGENTA2 = 0x00FF00FFu;
+                                for (const auto& ev : text_sub_events) {
+                                    std::wstring wtxt = strip_ass2(ev.ass_text);
+                                    if (wtxt.empty()) continue;
+                                    RECT measure2 = {0, 0, (LONG)max_tw, 0};
+                                    DrawTextW(mem_dc, wtxt.c_str(), -1, &measure2,
+                                              DT_CALCRECT | DT_CENTER | DT_WORDBREAK);
+                                    int tw = measure2.right - measure2.left;
+                                    int th = measure2.bottom - measure2.top;
+                                    if (tw <= 0 || th <= 0) continue;
+                                    const int outline2 = 2, pad2 = outline2 + 1;
+                                    int tx = (frame_w - tw) / 2;
+                                    int ty = frame_h - margin_v - th;
+                                    if (tx < pad2) tx = pad2;
+                                    if (ty < pad2) ty = pad2;
+                                    int rx = tx - pad2, ry = ty - pad2;
+                                    int rw = tw + pad2 * 2, rh = th + pad2 * 2;
+                                    if (rx + rw > frame_w) rw = frame_w - rx;
+                                    if (ry + rh > frame_h) rh = frame_h - ry;
+                                    if (rw <= 0 || rh <= 0) continue;
+                                    for (int dy = 0; dy < rh; dy++)
+                                        for (int dx = 0; dx < rw; dx++)
+                                            pixels2[(ry + dy) * frame_w + (rx + dx)] = MAGENTA2;
+                                    RECT draw_rect2 = {(LONG)tx, (LONG)ty, (LONG)(tx+tw), (LONG)(ty+th)};
+                                    SetTextColor(mem_dc, RGB(0, 0, 0));
+                                    for (int oy = -outline2; oy <= outline2; oy++)
+                                        for (int ox = -outline2; ox <= outline2; ox++) {
+                                            if (ox == 0 && oy == 0) continue;
+                                            RECT r2b = {draw_rect2.left+ox, draw_rect2.top+oy,
+                                                        draw_rect2.right+ox, draw_rect2.bottom+oy};
+                                            DrawTextW(mem_dc, wtxt.c_str(), -1, &r2b, DT_CENTER | DT_WORDBREAK);
+                                        }
+                                    SetTextColor(mem_dc, RGB(255, 255, 255));
+                                    DrawTextW(mem_dc, wtxt.c_str(), -1, &draw_rect2, DT_CENTER | DT_WORDBREAK);
+                                    PgsRect pg2;
+                                    pg2.x = rx; pg2.y = ry; pg2.w = rw; pg2.h = rh;
+                                    pg2.yuva.resize((size_t)rw * rh * 4);
+                                    for (int dy = 0; dy < rh; dy++) {
+                                        for (int dx = 0; dx < rw; dx++) {
+                                            uint32_t pv = pixels2[(ry + dy) * frame_w + (rx + dx)];
+                                            uint8_t r = (uint8_t)((pv >> 16) & 0xFF);
+                                            uint8_t g = (uint8_t)((pv >>  8) & 0xFF);
+                                            uint8_t b = (uint8_t)( pv        & 0xFF);
+                                            bool is_bg = (r > 200 && g < 30 && b > 200);
+                                            uint8_t Y, Cb, Cr, A;
+                                            if (is_bg) {
+                                                Y = 16; Cb = 128; Cr = 128; A = 0;
+                                            } else {
+                                                Y  = (uint8_t)(16  + ( 65*r + 129*g +  25*b + 128) / 256);
+                                                Cb = (uint8_t)(128 + (-38*r -  74*g + 112*b + 128) / 256);
+                                                Cr = (uint8_t)(128 + (112*r -  94*g -  18*b + 128) / 256);
+                                                A  = 255;
+                                            }
+                                            size_t idx = ((size_t)dy * rw + dx) * 4;
+                                            pg2.yuva[idx]   = Y;
+                                            pg2.yuva[idx+1] = Cb;
+                                            pg2.yuva[idx+2] = Cr;
+                                            pg2.yuva[idx+3] = A;
+                                        }
+                                    }
+                                    PgsEvent start_ev2;
+                                    start_ev2.pts_ms = (int64_t)(ev.start_s * 1000.0);
+                                    start_ev2.rects.push_back(std::move(pg2));
+                                    pgs_events.push_back(std::move(start_ev2));
+                                    PgsEvent end_ev2;
+                                    end_ev2.pts_ms = (int64_t)(ev.end_s * 1000.0);
+                                    pgs_events.push_back(std::move(end_ev2));
+                                }
+                                SelectObject(mem_dc, old_font2);
+                                DeleteObject(hfont2);
+                                SelectObject(mem_dc, old_bm2);
+                            }
+                            if (hbm2)    DeleteObject(hbm2);
+                            if (mem_dc)  DeleteDC(mem_dc);
+                            std::sort(pgs_events.begin(), pgs_events.end(),
+                                [](const PgsEvent& a, const PgsEvent& b){ return a.pts_ms < b.pts_ms; });
+                            use_bitmap_subs = !pgs_events.empty();
+                        }
                     }
                 } else {
                     avfilter_graph_free(&filter_graph); filter_graph = nullptr;
@@ -3328,95 +3843,170 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                             }
                         }
 
-                        // --- write temp ASS file and retry the filter ---
+                        // --- GDI text rendering fallback (no libass required) ---
+                        // Render decoded text events as YUVA bitmaps and feed into the
+                        // existing pgs_events / use_bitmap_subs blending path.
                         if (!text_sub_events.empty()) {
-                            char tmp_dir[MAX_PATH] = {};
-                            GetTempPathA(MAX_PATH, tmp_dir);
-                            GetTempFileNameA(tmp_dir, "sub", 0, temp_ass_path);
-                            FILE* fass = nullptr; fopen_s(&fass, temp_ass_path, "w");
-                            if (fass) {
-                                int fsz = max(12, enc_ctx->height / 18);
-                                fprintf(fass,
-                                    "[Script Info]\r\nScriptType: v4.00+\r\n"
-                                    "PlayResX: %d\r\nPlayResY: %d\r\nWrapStyle: 0\r\n\r\n",
-                                    enc_ctx->width, enc_ctx->height);
-                                fprintf(fass,
-                                    "[V4+ Styles]\r\n"
-                                    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,"
-                                    " OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,"
-                                    " ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow,"
-                                    " Alignment, MarginL, MarginR, MarginV, Encoding\r\n"
-                                    "Style: Default,Arial,%d,&H00FFFFFF,&H000000FF,&H00000000,"
-                                    "&H80000000,-1,0,0,0,100,100,0,0,1,2,0,2,10,10,%d,1\r\n\r\n",
-                                    fsz, fsz);
-                                fprintf(fass,
-                                    "[Events]\r\n"
-                                    "Format: Layer, Start, End, Style, Name,"
-                                    " MarginL, MarginR, MarginV, Effect, Text\r\n");
-                                auto ass_t = [](char* buf, size_t len, double t) {
-                                    if (t < 0) t = 0;
-                                    int h  = (int)(t / 3600);
-                                    int m  = (int)(t / 60) % 60;
-                                    int s  = (int)t % 60;
-                                    int cs = (int)((t - (int)t) * 100);
-                                    snprintf(buf, len, "%d:%02d:%02d.%02d", h, m, s, cs);
-                                };
-                                for (const auto& ev : text_sub_events) {
-                                    char ts[24], te[24];
-                                    ass_t(ts, sizeof(ts), ev.start_s);
-                                    ass_t(te, sizeof(te), ev.end_s);
-                                    fprintf(fass, "Dialogue: 0,%s,%s,Default,,0,0,0,,%s\r\n",
-                                        ts, te, ev.ass_text.c_str());
-                                }
-                                fclose(fass);
+                            int frame_w  = enc_ctx->width;
+                            int frame_h  = enc_ctx->height;
+                            int font_h   = max(14, frame_h / 20);
+                            int margin_v = max(12, frame_h / 18);
+                            int max_tw   = frame_w * 85 / 100;
 
-                                // Retry filter graph with the temp ASS file (no stream-index needed)
-                                const AVFilter* bsrc2  = avfilter_get_by_name("buffer");
-                                const AVFilter* bsink2 = avfilter_get_by_name("buffersink");
-                                filter_graph = (bsrc2 && bsink2) ? avfilter_graph_alloc() : nullptr;
-                                if (filter_graph) {
-                                    int r2 = avfilter_graph_create_filter(&buffersrc_ctx,  bsrc2,  "in",  src_args, nullptr, filter_graph);
-                                    if (r2 >= 0)
-                                        r2  = avfilter_graph_create_filter(&buffersink_ctx, bsink2, "out", nullptr,  nullptr, filter_graph);
-                                    if (r2 >= 0) {
-                                        // Escape temp path (backslashes → forward slashes)
-                                        char esc2[MAX_PATH * 2]; int k2 = 0;
-                                        for (int j2 = 0; temp_ass_path[j2] && k2 < (int)sizeof(esc2)-2; j2++) {
-                                            char c2 = temp_ass_path[j2];
-                                            esc2[k2++] = (c2 == '\\') ? '/' : c2;
+                            HDC screen_dc = GetDC(nullptr);
+                            HDC mem_dc    = CreateCompatibleDC(screen_dc);
+                            BITMAPINFO bmi = {};
+                            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+                            bmi.bmiHeader.biWidth       = frame_w;
+                            bmi.bmiHeader.biHeight      = -frame_h; // top-down
+                            bmi.bmiHeader.biPlanes      = 1;
+                            bmi.bmiHeader.biBitCount    = 32;
+                            bmi.bmiHeader.biCompression = BI_RGB;
+                            uint32_t* pixels = nullptr;
+                            HBITMAP hbm = CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS,
+                                                           (void**)&pixels, nullptr, 0);
+                            ReleaseDC(nullptr, screen_dc);
+
+                            if (hbm && pixels && mem_dc) {
+                                HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+                                // NONANTIALIASED_QUALITY ensures pixels are exactly the text
+                                // colour or the background key with no blended intermediates.
+                                HFONT hfont = CreateFontA(
+                                    -font_h, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                                HFONT old_font = (HFONT)SelectObject(mem_dc, hfont);
+                                SetBkMode(mem_dc, TRANSPARENT);
+
+                                // Strip ASS override tags; convert \N / \n to newline, \h to space.
+                                auto strip_ass = [](const std::string& s) -> std::wstring {
+                                    std::string out;
+                                    bool in_tag = false;
+                                    for (size_t i = 0; i < s.size(); i++) {
+                                        if (s[i] == '{') { in_tag = true;  continue; }
+                                        if (s[i] == '}') { in_tag = false; continue; }
+                                        if (in_tag) continue;
+                                        if (s[i] == '\\' && i + 1 < s.size()) {
+                                            char n = s[i + 1];
+                                            if (n == 'N' || n == 'n') { out += '\n'; i++; continue; }
+                                            if (n == 'h')             { out += ' ';  i++; continue; }
                                         }
-                                        esc2[k2] = '\0';
-                                        char filt2[MAX_PATH * 2 + 64];
-                                        snprintf(filt2, sizeof(filt2), "subtitles='%s'", esc2);
-                                        AVFilterInOut* o2 = avfilter_inout_alloc();
-                                        AVFilterInOut* i2 = avfilter_inout_alloc();
-                                        if (o2 && i2) {
-                                            o2->name = av_strdup("in");  o2->filter_ctx = buffersrc_ctx;  o2->pad_idx = 0; o2->next = nullptr;
-                                            i2->name = av_strdup("out"); i2->filter_ctx = buffersink_ctx; i2->pad_idx = 0; i2->next = nullptr;
-                                            r2 = avfilter_graph_parse_ptr(filter_graph, filt2, &i2, &o2, nullptr);
-                                            if (r2 >= 0) r2 = avfilter_graph_config(filter_graph, nullptr);
-                                        }
-                                        avfilter_inout_free(&o2);
-                                        avfilter_inout_free(&i2);
-                                        if (r2 >= 0) {
-                                            use_filter = true;
-                                        } else {
-                                            avfilter_graph_free(&filter_graph); filter_graph = nullptr;
-                                            buffersrc_ctx = nullptr; buffersink_ctx = nullptr;
-                                        }
-                                    } else {
-                                        avfilter_graph_free(&filter_graph); filter_graph = nullptr;
+                                        out += s[i];
                                     }
-                                }
-                            }
-                        }
+                                    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+                                        out.pop_back();
+                                    int wlen = MultiByteToWideChar(CP_UTF8, 0, out.c_str(), -1, nullptr, 0);
+                                    std::wstring w(wlen, 0);
+                                    MultiByteToWideChar(CP_UTF8, 0, out.c_str(), -1, &w[0], wlen);
+                                    if (!w.empty() && w.back() == 0) w.pop_back();
+                                    return w;
+                                };
 
-                        if (!use_filter) {
-                            MessageBoxA(nullptr,
-                                "Subtitle burn-in failed: the subtitles filter could not be\n"
-                                "initialised and the pre-decoded fallback also failed.\n\n"
-                                "Check that your FFmpeg build includes libass.",
-                                "Subtitle Error", MB_OK | MB_ICONWARNING);
+                                // Magenta (R=255,G=0,B=255) used as background transparency key.
+                                // In a 32-bpp top-down DIB the DWORD layout is 0x00RRGGBB.
+                                const uint32_t MAGENTA = 0x00FF00FFu;
+
+                                for (const auto& ev : text_sub_events) {
+                                    std::wstring wtxt = strip_ass(ev.ass_text);
+                                    if (wtxt.empty()) continue;
+
+                                    // Measure wrapped text dimensions.
+                                    RECT measure = {0, 0, (LONG)max_tw, 0};
+                                    DrawTextW(mem_dc, wtxt.c_str(), -1, &measure,
+                                              DT_CALCRECT | DT_CENTER | DT_WORDBREAK);
+                                    int tw = measure.right  - measure.left;
+                                    int th = measure.bottom - measure.top;
+                                    if (tw <= 0 || th <= 0) continue;
+
+                                    // Position: centred horizontally, above bottom margin.
+                                    const int outline = 2;
+                                    const int pad     = outline + 1;
+                                    int tx = (frame_w - tw) / 2;
+                                    int ty = frame_h - margin_v - th;
+                                    if (tx < pad) tx = pad;
+                                    if (ty < pad) ty = pad;
+
+                                    // Bounding rect including outline padding.
+                                    int rx = tx - pad, ry = ty - pad;
+                                    int rw = tw + pad * 2, rh = th + pad * 2;
+                                    if (rx + rw > frame_w) rw = frame_w - rx;
+                                    if (ry + rh > frame_h) rh = frame_h - ry;
+                                    if (rw <= 0 || rh <= 0) continue;
+
+                                    // Fill bounding area with magenta key colour.
+                                    for (int dy = 0; dy < rh; dy++)
+                                        for (int dx = 0; dx < rw; dx++)
+                                            pixels[(ry + dy) * frame_w + (rx + dx)] = MAGENTA;
+
+                                    RECT draw_rect = {(LONG)tx, (LONG)ty,
+                                                      (LONG)(tx + tw), (LONG)(ty + th)};
+
+                                    // Draw black outline at all surrounding offsets.
+                                    SetTextColor(mem_dc, RGB(0, 0, 0));
+                                    for (int oy = -outline; oy <= outline; oy++) {
+                                        for (int ox = -outline; ox <= outline; ox++) {
+                                            if (ox == 0 && oy == 0) continue;
+                                            RECT r2 = {draw_rect.left + ox, draw_rect.top + oy,
+                                                       draw_rect.right + ox, draw_rect.bottom + oy};
+                                            DrawTextW(mem_dc, wtxt.c_str(), -1, &r2,
+                                                      DT_CENTER | DT_WORDBREAK);
+                                        }
+                                    }
+
+                                    // Draw white main text on top.
+                                    SetTextColor(mem_dc, RGB(255, 255, 255));
+                                    DrawTextW(mem_dc, wtxt.c_str(), -1, &draw_rect,
+                                              DT_CENTER | DT_WORDBREAK);
+
+                                    // Convert bounding rect pixels to YUVA (BT.709 limited range).
+                                    PgsRect pg;
+                                    pg.x = rx; pg.y = ry; pg.w = rw; pg.h = rh;
+                                    pg.yuva.resize((size_t)rw * rh * 4);
+                                    for (int dy = 0; dy < rh; dy++) {
+                                        for (int dx = 0; dx < rw; dx++) {
+                                            uint32_t pv = pixels[(ry + dy) * frame_w + (rx + dx)];
+                                            uint8_t r = (uint8_t)((pv >> 16) & 0xFF);
+                                            uint8_t g = (uint8_t)((pv >>  8) & 0xFF);
+                                            uint8_t b = (uint8_t)( pv        & 0xFF);
+                                            bool is_bg = (r > 200 && g < 30 && b > 200);
+                                            uint8_t Y, Cb, Cr, A;
+                                            if (is_bg) {
+                                                Y = 16; Cb = 128; Cr = 128; A = 0;
+                                            } else {
+                                                Y  = (uint8_t)(16  + ( 65*r + 129*g +  25*b + 128) / 256);
+                                                Cb = (uint8_t)(128 + (-38*r -  74*g + 112*b + 128) / 256);
+                                                Cr = (uint8_t)(128 + (112*r -  94*g -  18*b + 128) / 256);
+                                                A  = 255;
+                                            }
+                                            size_t idx = ((size_t)dy * rw + dx) * 4;
+                                            pg.yuva[idx]   = Y;
+                                            pg.yuva[idx+1] = Cb;
+                                            pg.yuva[idx+2] = Cr;
+                                            pg.yuva[idx+3] = A;
+                                        }
+                                    }
+
+                                    // Add start event (rect visible) and end event (clear screen).
+                                    PgsEvent start_ev;
+                                    start_ev.pts_ms = (int64_t)(ev.start_s * 1000.0);
+                                    start_ev.rects.push_back(std::move(pg));
+                                    pgs_events.push_back(std::move(start_ev));
+
+                                    PgsEvent end_ev;
+                                    end_ev.pts_ms = (int64_t)(ev.end_s * 1000.0);
+                                    pgs_events.push_back(std::move(end_ev));
+                                }
+
+                                SelectObject(mem_dc, old_font);
+                                DeleteObject(hfont);
+                                SelectObject(mem_dc, old_bm);
+                            }
+                            if (hbm)    DeleteObject(hbm);
+                            if (mem_dc) DeleteDC(mem_dc);
+
+                            std::sort(pgs_events.begin(), pgs_events.end(),
+                                [](const PgsEvent& a, const PgsEvent& b){ return a.pts_ms < b.pts_ms; });
+                            use_bitmap_subs = !pgs_events.empty();
                         }
                     }
                 } else {
@@ -3428,10 +4018,32 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
 
     while (av_read_frame(in_fmt_ctx, pkt) >= 0) {
         if (pkt->stream_index == videoStreamIndex) {
-            if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
+            if (pkt->dts != AV_NOPTS_VALUE) last_vid_pkt_dts = pkt->dts;
+            if (trans_bsf_ctx) {
+                if (av_bsf_send_packet(trans_bsf_ctx, pkt) >= 0) {
+                    while (av_bsf_receive_packet(trans_bsf_ctx, trans_bsf_pkt) >= 0) {
+                        if (trans_bsf_pkt->dts != AV_NOPTS_VALUE) last_vid_pkt_dts = trans_bsf_pkt->dts;
+                        avcodec_send_packet(dec_ctx, trans_bsf_pkt);
+                        av_packet_unref(trans_bsf_pkt);
+                    }
+                }
+                av_packet_unref(pkt);
+            } else {
+                if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
+            }
             while (avcodec_receive_frame(dec_ctx, frame) == 0) {
-                int64_t in_pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE) ? frame->best_effort_timestamp : frame->pts;
-                double in_time = in_pts * av_q2d(video_in_stream->time_base);
+                int64_t in_pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                    ? frame->best_effort_timestamp
+                                    : (frame->pts != AV_NOPTS_VALUE ? frame->pts : vid_stream_start);
+                // Subtract stream start_time so in_time is elapsed seconds from the
+                // beginning of the file regardless of container offset (AVI/Xvid fix).
+                double in_time = (in_pts - vid_stream_start) * av_q2d(video_in_stream->time_base);
+                // Guard against stale VOP timestamps (e.g. Xvid clip cut from a long recording).
+                if (in_time < -1.0 || in_time > end_seconds + segment_duration) {
+                    int64_t dts_fb = (last_vid_pkt_dts != AV_NOPTS_VALUE) ? last_vid_pkt_dts : vid_stream_start;
+                    in_pts  = dts_fb;
+                    in_time = (in_pts - vid_stream_start) * av_q2d(video_in_stream->time_base);
+                }
                 if (in_time > end_seconds) { av_frame_unref(frame); goto flush_encoder; }
 
                 // Drop frames that still decode before the requested start
@@ -3637,8 +4249,8 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                  && aDec_ctx && aEnc_ctx && aSwrCtx) {
             AVRational in_tb = audio_in_stream->time_base;
             int64_t aud_in_pts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts
-                                : (pkt->dts != AV_NOPTS_VALUE) ? pkt->dts : 0;
-            double aud_time = aud_in_pts * av_q2d(in_tb);
+                                : (pkt->dts != AV_NOPTS_VALUE) ? pkt->dts : aud_stream_start;
+            double aud_time = (aud_in_pts - aud_stream_start) * av_q2d(in_tb);
             if (aud_time < start_seconds || aud_time > end_seconds) { av_packet_unref(pkt); continue; }
 
             if (avcodec_send_packet(aDec_ctx, pkt) >= 0) {
@@ -3709,7 +4321,8 @@ flush_encoder:
     success = true;
 
 cleanup:
-    if (temp_ass_path[0]) DeleteFileA(temp_ass_path);
+    if (trans_bsf_pkt) av_packet_free(&trans_bsf_pkt);
+    if (trans_bsf_ctx) av_bsf_free(&trans_bsf_ctx);
     if (filter_graph) avfilter_graph_free(&filter_graph);
     if (sws_ctx) sws_freeContext(sws_ctx);
     if (sws_hdr2rgb) sws_freeContext(sws_hdr2rgb);
@@ -4003,6 +4616,49 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             SelectObject(memDC, oldPen);
             DeleteObject(sepPen);
+        }
+
+        // Mark-in / mark-out overlays (darken excluded ranges)
+        if (g_tlMax > 0 && W > 0 && (g_markInMs >= 0 || g_markOutMs >= 0)) {
+            HDC overDC      = CreateCompatibleDC(memDC);
+            HBITMAP overBmp = CreateCompatibleBitmap(memDC, W, H);
+            HBITMAP overOld = (HBITMAP)SelectObject(overDC, overBmp);
+            HBRUSH darkBrush = CreateSolidBrush(RGB(0, 0, 0));
+            RECT overRc = {0, 0, W, H};
+            FillRect(overDC, &overRc, darkBrush);
+            DeleteObject(darkBrush);
+            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 220, 0};
+            if (g_markInMs >= 0) {
+                int px = (int)((double)g_markInMs / g_tlMax * W);
+                if (px > 0) AlphaBlend(memDC, 0, 0, px, H, overDC, 0, 0, px, H, bf);
+            }
+            if (g_markOutMs >= 0) {
+                int px = (int)((double)g_markOutMs / g_tlMax * W);
+                if (px < W - 1) AlphaBlend(memDC, px + 1, 0, W - px - 1, H, overDC, px + 1, 0, W - px - 1, H, bf);
+            }
+            SelectObject(overDC, overOld);
+            DeleteObject(overBmp);
+            DeleteDC(overDC);
+            // Mark-in line (violet, matches button icon colour)
+            if (g_markInMs >= 0) {
+                int px = (int)((double)g_markInMs / g_tlMax * W);
+                HPEN markPen = CreatePen(PS_SOLID, 2, RGB(155, 95, 255));
+                HPEN oldPen  = (HPEN)SelectObject(memDC, markPen);
+                MoveToEx(memDC, px, 0, nullptr);
+                LineTo(memDC, px, H);
+                SelectObject(memDC, oldPen);
+                DeleteObject(markPen);
+            }
+            // Mark-out line (hot-pink, matches button icon colour)
+            if (g_markOutMs >= 0) {
+                int px = (int)((double)g_markOutMs / g_tlMax * W);
+                HPEN markPen = CreatePen(PS_SOLID, 2, RGB(255, 75, 135));
+                HPEN oldPen  = (HPEN)SelectObject(memDC, markPen);
+                MoveToEx(memDC, px, 0, nullptr);
+                LineTo(memDC, px, H);
+                SelectObject(memDC, oldPen);
+                DeleteObject(markPen);
+            }
         }
 
         // White playhead line
