@@ -76,6 +76,7 @@ extern "C" {
 #define IDC_BTN_MARKOUT           2006
 #define IDC_BTN_GOTO_MARKIN       2007
 #define IDC_BTN_GOTO_MARKOUT      2008
+#define IDC_BTN_ZOOM              2009
 
 #define IDT_UI_REFRESH            3001
 #define IDT_ENCODE_PROGRESS       3002
@@ -147,6 +148,17 @@ static HWND     g_hBtnGotoMarkIn  = nullptr;
 static HWND     g_hBtnGotoMarkOut = nullptr;
 static int64_t  g_markInMs  = -1;   // -1 = not set
 static int64_t  g_markOutMs = -1;
+
+static HWND     g_hBtnZoom         = nullptr;
+static bool     g_isZoomed         = false;
+static int64_t  g_zoomCenterMs     = 0;
+static int64_t  g_zoomStartMs      = 0;
+static int64_t  g_zoomEndMs        = 0;
+static HANDLE   g_zoomThumbThread  = nullptr;
+static volatile bool g_zoomThumbStop = false;
+static HBITMAP  g_zoomThumbs[21]   = {};
+static double   g_thumbTimes[21]   = {};      // absolute time (seconds) for each normal thumbnail
+static double   g_zoomThumbTimes[21] = {};    // absolute time (seconds) for each zoom thumbnail
 
 static HWND     g_hGrpSettings   = nullptr;
 static HWND     g_hGrpRange      = nullptr;
@@ -236,6 +248,7 @@ static bool IsSystemDarkMode();
 static void ApplyTheme(HWND hwnd);
 void HandleResize(HWND hwnd, int clientW, int clientH);
 static unsigned __stdcall ThumbExtractThreadProc(void* param);
+static unsigned __stdcall ZoomThumbThreadProc(void* param);
 bool GetVideoInfo(const char* filepath, int& width, int& height, double& durationSeconds);
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
 bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
@@ -442,7 +455,8 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         MoveWindow(g_hBtnMarkIn,      bx, iy, btnW,  btnH, TRUE); bx += btnW + 4;
         MoveWindow(g_hBtnGotoMarkIn,  bx, iy, gotoW, btnH, TRUE); bx += gotoW + 10;
         MoveWindow(g_hBtnMarkOut,     bx, iy, btnW,  btnH, TRUE); bx += btnW + 4;
-        MoveWindow(g_hBtnGotoMarkOut, bx, iy, gotoW, btnH, TRUE);
+        MoveWindow(g_hBtnGotoMarkOut, bx, iy, gotoW, btnH, TRUE); bx += gotoW + 6;
+        MoveWindow(g_hBtnZoom,        bx, iy, gotoW, btnH, TRUE);
         iy += btnH + 6;
         MoveWindow(g_hTimeline, ix, iy, avail, seekH, TRUE);
     }
@@ -875,6 +889,23 @@ static void DrawPlayerButton(const DRAWITEMSTRUCT* dis) {
         Gdiplus::PointF pts[3] = { {cx - 3.0f, cy - 6.0f}, {cx - 3.0f, cy + 6.0f}, {cx + 7.0f, cy} };
         g.FillPolygon(&b, pts, 3);
     }
+    else if (id == IDC_BTN_ZOOM) {
+        // Magnifier: circle + handle. When zoomed show "-" inside, else "+".
+        Gdiplus::Color col(a, g_isZoomed ? 255 : 180, g_isZoomed ? 200 : 200, g_isZoomed ? 80 : 200);
+        Gdiplus::Pen pen(col, 2.0f);
+        // lens circle
+        g.DrawEllipse(&pen, cx - 7.0f, cy - 8.0f, 11.0f, 11.0f);
+        // handle
+        g.DrawLine(&pen, cx + 4.5f, cy + 3.5f, cx + 8.5f, cy + 8.5f);
+        // + or - inside lens
+        Gdiplus::Pen inner(col, 1.5f);
+        if (g_isZoomed) {
+            g.DrawLine(&inner, cx - 4.5f, cy - 2.5f, cx + 1.5f, cy - 2.5f);
+        } else {
+            g.DrawLine(&inner, cx - 1.5f, cy - 5.5f, cx - 1.5f, cy + 0.5f);
+            g.DrawLine(&inner, cx - 4.5f, cy - 2.5f, cx + 1.5f, cy - 2.5f);
+        }
+    }
     }   // end else (player buttons)
     }   // end Graphics scope — GDI+ content flushed to memDC
 
@@ -1111,6 +1142,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hBtnGotoMarkOut = CreateWindowEx(0, L"BUTTON", L"",
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 572, 250, 38, 26, hwnd,
             (HMENU)IDC_BTN_GOTO_MARKOUT, GetModuleHandle(nullptr), nullptr);
+        g_hBtnZoom = CreateWindowEx(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW, 614, 250, 38, 26, hwnd,
+            (HMENU)IDC_BTN_ZOOM, GetModuleHandle(nullptr), nullptr);
         g_hTimeline = CreateWindowEx(0, L"ResizerTimeline", L"",
             WS_CHILD | WS_VISIBLE,
             10, 285, 600, 72, hwnd, (HMENU)IDC_SEEKBAR, GetModuleHandle(nullptr), nullptr);
@@ -1154,7 +1188,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             applyLabelFont(g_hSubsStatic);     applyFont(g_hSubsDrop);
             applyFont(g_hBtnPlayPause);   applyFont(g_hBtnBack);
             applyFont(g_hBtnFwd);         applyFont(g_hBtnMarkIn);   applyFont(g_hBtnMarkOut);
-            applyFont(g_hBtnGotoMarkIn);  applyFont(g_hBtnGotoMarkOut);
+            applyFont(g_hBtnGotoMarkIn);  applyFont(g_hBtnGotoMarkOut);  applyFont(g_hBtnZoom);
             applyFont(g_hGrpSaveLoc);
             applyLabelFont(g_hSaveSameRadio);  applyLabelFont(g_hSaveCustomRadio);
             applyFont(g_hSavePathEdit);        applyFont(g_hSaveBrowseBtn);
@@ -1191,6 +1225,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         addTip(g_hBtnMarkOut,      L"Set clip end to current position  [O]");
         addTip(g_hBtnGotoMarkIn,   L"Jump playhead to mark-in position");
         addTip(g_hBtnGotoMarkOut,  L"Jump playhead to mark-out position");
+        addTip(g_hBtnZoom,         L"Zoom timeline \u00b130 s around playhead (click again to zoom out)");
 
         // Try to initialise CUDA device for NVDEC hardware decoding.
         TryInitHWDevice();
@@ -1355,6 +1390,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_tlEnabled = true;
                 g_markInMs  = -1;
                 g_markOutMs = -1;
+                // Reset zoom state on new file
+                g_isZoomed = false;
+                g_zoomThumbStop = true;
+                if (g_zoomThumbThread) {
+                    WaitForSingleObject(g_zoomThumbThread, 2000);
+                    CloseHandle(g_zoomThumbThread); g_zoomThumbThread = nullptr;
+                }
+                for (int zi = 0; zi < 21; zi++) {
+                    if (g_zoomThumbs[zi]) { DeleteObject(g_zoomThumbs[zi]); g_zoomThumbs[zi] = nullptr; }
+                }
+                g_zoomThumbStop = false;
                 InvalidateRect(g_hTimeline, nullptr, TRUE);
 
                 EnableWindow(g_hBtnPlayPause, TRUE);
@@ -1364,6 +1410,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(g_hBtnMarkOut, TRUE);
                 EnableWindow(g_hBtnGotoMarkIn,  FALSE);
                 EnableWindow(g_hBtnGotoMarkOut, FALSE);
+                EnableWindow(g_hBtnZoom,        TRUE);
                 InvalidateRect(g_hBtnPlayPause, nullptr, TRUE);
 
                 // Start thumbnail extraction in background
@@ -1710,6 +1757,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SeekMs(g_markOutMs, !g_isPlaying);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
+        else if (id == IDC_BTN_ZOOM && g_playerReady) {
+            // Stop any previous zoom thread and discard zoom thumbs.
+            g_zoomThumbStop = true;
+            if (g_zoomThumbThread) {
+                WaitForSingleObject(g_zoomThumbThread, 2000);
+                CloseHandle(g_zoomThumbThread); g_zoomThumbThread = nullptr;
+            }
+            for (int zi = 0; zi < 21; zi++) {
+                if (g_zoomThumbs[zi]) { DeleteObject(g_zoomThumbs[zi]); g_zoomThumbs[zi] = nullptr; }
+            }
+
+            if (g_isZoomed) {
+                // Zoom out — return to normal timeline.
+                g_isZoomed = false;
+            } else {
+                // Zoom in — centre on current playhead, ±30 s window.
+                g_isZoomed     = true;
+                g_zoomCenterMs = g_currentPosMs;
+                g_zoomStartMs  = max((int64_t)0, g_zoomCenterMs - 30000LL);
+                g_zoomEndMs    = (int64_t)min(g_duration * 1000.0, (double)(g_zoomCenterMs + 30000LL));
+                g_zoomThumbStop = false;
+                g_zoomThumbThread = (HANDLE)_beginthreadex(nullptr, 0, ZoomThumbThreadProc, nullptr, 0, nullptr);
+            }
+            InvalidateRect(g_hBtnZoom, nullptr, TRUE);
+            InvalidateRect(g_hTimeline, nullptr, TRUE);
+        }
         break;
     }
 
@@ -1822,6 +1895,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         for (int i = 0; i < 21; i++) {
             if (g_thumbs[i]) { DeleteObject(g_thumbs[i]); g_thumbs[i] = nullptr; }
+        }
+        g_zoomThumbStop = true;
+        if (g_zoomThumbThread) {
+            WaitForSingleObject(g_zoomThumbThread, 2000);
+            CloseHandle(g_zoomThumbThread); g_zoomThumbThread = nullptr;
+        }
+        for (int i = 0; i < 21; i++) {
+            if (g_zoomThumbs[i]) { DeleteObject(g_zoomThumbs[i]); g_zoomThumbs[i] = nullptr; }
         }
         if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
         if (g_hFont)        { DeleteObject(g_hFont);        g_hFont        = nullptr; }
@@ -4476,6 +4557,7 @@ static unsigned __stdcall ThumbExtractThreadProc(void* /*param*/) {
         // Use the left edge of each slot so the thumbnail shows the first frame
         // of that section — more intuitive than the centre when browsing.
         double t = (double)i / N * g_duration;
+        g_thumbTimes[i] = t;
 
         AVStream* vs    = fmt_ctx->streams[videoIdx];
         double    tbase = av_q2d(vs->time_base);
@@ -4592,6 +4674,171 @@ tf_done:
     return 0;
 }
 
+static unsigned __stdcall ZoomThumbThreadProc(void* /*param*/) {
+    const int N = 21;
+
+    // Compute the 21 thumbnail times: center ± 30 s at 3-second intervals.
+    double times[N];
+    for (int i = 0; i < N; i++) {
+        double t = g_zoomCenterMs / 1000.0 + (i - 10) * 3.0;
+        if (t < 0.0)          t = 0.0;
+        if (t > g_duration)   t = g_duration;
+        times[i]             = t;
+        g_zoomThumbTimes[i]  = t;
+    }
+
+    AVFormatContext* fmt_ctx   = nullptr;
+    AVCodecContext*  dec_ctx   = nullptr;
+    SwsContext*      sws_ctx   = nullptr;
+    AVPacket*        pkt       = nullptr;
+    AVFrame*         frame     = nullptr;
+    AVFrame*         rgbFrame  = nullptr;
+    uint8_t*         rgbBuffer = nullptr;
+    int              videoIdx  = -1;
+    int              dstW = 0, dstH = 90;
+    int              srcW = 0, srcH = 0;
+
+    if (avformat_open_input(&fmt_ctx, g_inputPath, nullptr, nullptr) < 0) goto zt_done;
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) goto zt_done;
+    for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            videoIdx = (int)i; break;
+        }
+    }
+    if (videoIdx < 0) goto zt_done;
+    {
+        AVStream* vs = fmt_ctx->streams[videoIdx];
+        const AVCodec* dec = avcodec_find_decoder(vs->codecpar->codec_id);
+        if (!dec) goto zt_done;
+        dec_ctx = avcodec_alloc_context3(dec);
+        if (!dec_ctx) goto zt_done;
+        if (avcodec_parameters_to_context(dec_ctx, vs->codecpar) < 0) goto zt_done;
+        if (avcodec_open2(dec_ctx, dec, nullptr) < 0) goto zt_done;
+
+        srcW = dec_ctx->width; srcH = dec_ctx->height;
+        dstW = (srcH > 0) ? (int)((double)srcW / srcH * dstH) : 160;
+        if (dstW < 1) dstW = 1;
+
+        int bufSize = av_image_get_buffer_size(AV_PIX_FMT_BGR24, dstW, dstH, 1);
+        rgbBuffer = (uint8_t*)av_malloc(bufSize);
+        frame    = av_frame_alloc();
+        rgbFrame = av_frame_alloc();
+        pkt      = av_packet_alloc();
+        if (!rgbBuffer || !frame || !rgbFrame || !pkt) goto zt_done;
+        av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, rgbBuffer,
+            AV_PIX_FMT_BGR24, dstW, dstH, 1);
+    }
+
+    for (int i = 0; i < N && !g_zoomThumbStop; i++) {
+        double t     = times[i];
+        AVStream* vs = fmt_ctx->streams[videoIdx];
+        double tbase = av_q2d(vs->time_base);
+        bool gotFrame = false;
+
+        av_seek_frame(fmt_ctx, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(dec_ctx);
+
+        while (!g_zoomThumbStop && !gotFrame && av_read_frame(fmt_ctx, pkt) >= 0) {
+            if (pkt->stream_index == videoIdx && avcodec_send_packet(dec_ctx, pkt) == 0) {
+                while (!gotFrame && avcodec_receive_frame(dec_ctx, frame) == 0) {
+                    int64_t pts = frame->best_effort_timestamp;
+                    if (pts == AV_NOPTS_VALUE) pts = frame->pts;
+                    double fSecs = (pts != AV_NOPTS_VALUE) ? (double)pts * tbase : t;
+                    if (fSecs + 0.001 >= t) {
+                        gotFrame = true;
+                        AVPixelFormat srcFmt = (AVPixelFormat)frame->format;
+                        bool isPQ  = (frame->color_trc == AVCOL_TRC_SMPTE2084);
+                        bool isHLG = (frame->color_trc == AVCOL_TRC_ARIB_STD_B67);
+                        if (isPQ || isHLG) {
+                            int srcCs    = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
+                                           frame->colorspace == AVCOL_SPC_BT2020_CL)
+                                           ? SWS_CS_BT2020 : SWS_CS_ITU709;
+                            int srcRange = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+                            SwsContext* hdr_sws = sws_getContext(
+                                srcW, srcH, srcFmt, dstW, dstH, AV_PIX_FMT_RGB48LE,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (hdr_sws) {
+                                sws_setColorspaceDetails(hdr_sws,
+                                    sws_getCoefficients(srcCs), srcRange,
+                                    sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1<<16, 1<<16);
+                                int rgb48Stride = dstW * 6;
+                                uint8_t* rgb48  = (uint8_t*)av_malloc(dstH * rgb48Stride);
+                                if (rgb48) {
+                                    uint8_t* d[1]={rgb48}; int s[1]={rgb48Stride};
+                                    sws_scale(hdr_sws, frame->data, frame->linesize, 0, srcH, d, s);
+                                    const double refW = isPQ ? 0.0203 : 0.25;
+                                    for (int y=0;y<dstH;y++){
+                                        const uint16_t* s16=(const uint16_t*)(rgb48+y*rgb48Stride);
+                                        uint8_t* d8=rgbFrame->data[0]+y*rgbFrame->linesize[0];
+                                        for(int x=0;x<dstW;x++){
+                                            double R=s16[x*3+0]/65535.0,G=s16[x*3+1]/65535.0,B=s16[x*3+2]/65535.0;
+                                            if(isPQ){R=pq_eotf(R);G=pq_eotf(G);B=pq_eotf(B);}
+                                            else    {R=hlg_eotf(R);G=hlg_eotf(G);B=hlg_eotf(B);}
+                                            double Ro=k_bt2020_to_bt709[0][0]*R+k_bt2020_to_bt709[0][1]*G+k_bt2020_to_bt709[0][2]*B;
+                                            double Go=k_bt2020_to_bt709[1][0]*R+k_bt2020_to_bt709[1][1]*G+k_bt2020_to_bt709[1][2]*B;
+                                            double Bo=k_bt2020_to_bt709[2][0]*R+k_bt2020_to_bt709[2][1]*G+k_bt2020_to_bt709[2][2]*B;
+                                            if(Ro<0)Ro=0;if(Go<0)Go=0;if(Bo<0)Bo=0;
+                                            Ro=reinhard_tm(Ro,refW);Go=reinhard_tm(Go,refW);Bo=reinhard_tm(Bo,refW);
+                                            d8[x*3+0]=srgb_pack(Bo);d8[x*3+1]=srgb_pack(Go);d8[x*3+2]=srgb_pack(Ro);
+                                        }
+                                    }
+                                    av_free(rgb48);
+                                } else { gotFrame = false; }
+                                sws_freeContext(hdr_sws);
+                            } else { gotFrame = false; }
+                        } else {
+                            if (!sws_ctx)
+                                sws_ctx = sws_getContext(srcW, srcH, srcFmt, dstW, dstH,
+                                    AV_PIX_FMT_BGR24, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (sws_ctx)
+                                sws_scale(sws_ctx, frame->data, frame->linesize, 0, srcH,
+                                          rgbFrame->data, rgbFrame->linesize);
+                            else
+                                gotFrame = false;
+                        }
+                    }
+                    av_frame_unref(frame);
+                }
+            }
+            av_packet_unref(pkt);
+        }
+
+        if (gotFrame && !g_zoomThumbStop) {
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth       = dstW;
+            bmi.bmiHeader.biHeight      = -dstH;
+            bmi.bmiHeader.biPlanes      = 1;
+            bmi.bmiHeader.biBitCount    = 24;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void* dibBits = nullptr;
+            HDC hdc = GetDC(nullptr);
+            HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+            ReleaseDC(nullptr, hdc);
+            if (bmp && dibBits) {
+                int srcRowBytes = dstW * 3;
+                int dibStride   = (srcRowBytes + 3) & ~3;
+                for (int y = 0; y < dstH; y++)
+                    memcpy((uint8_t*)dibBits + y * dibStride,
+                           rgbFrame->data[0] + y * rgbFrame->linesize[0], srcRowBytes);
+                g_zoomThumbs[i] = bmp;
+                PostMessage(g_mainHwnd, WM_APP_THUMBS_READY, 0, 0);
+            } else {
+                if (bmp) DeleteObject(bmp);
+            }
+        }
+    }
+
+zt_done:
+    if (sws_ctx)  sws_freeContext(sws_ctx);
+    if (frame)    av_frame_free(&frame);
+    if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
+    if (pkt)      av_packet_free(&pkt);
+    if (dec_ctx)  avcodec_free_context(&dec_ctx);
+    if (fmt_ctx)  avformat_close_input(&fmt_ctx);
+    return 0;
+}
+
 // ------------------------------ Timeline Window Proc ------------------------------
 LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -4604,9 +4851,6 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RECT rc; GetClientRect(hwnd, &rc);
         int W = rc.right, H = rc.bottom;
 
-        // Off-screen double buffer: all drawing goes to memDC; a single BitBlt
-        // at the end copies the finished image to the screen with no visible
-        // intermediate state, eliminating the dark-flash between frames.
         HDC     memDC  = CreateCompatibleDC(hdc);
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, W, H);
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
@@ -4616,99 +4860,159 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         FillRect(memDC, &rc, bgBrush);
         DeleteObject(bgBrush);
 
-        // Draw filmstrip thumbnails
-        if (g_thumbW > 0 && g_thumbH > 0 && W > 0) {
+        // In zoom mode use g_zoomThumbs/g_zoomThumbTimes;
+        // in normal mode use g_thumbs/g_thumbTimes.
+        HBITMAP* thumbArr  = g_isZoomed ? g_zoomThumbs : g_thumbs;
+        double*  timeArr   = g_isZoomed ? g_zoomThumbTimes : g_thumbTimes;
+
+        // Coordinate helpers — map ms↔pixels for the active range.
+        // In zoom mode the timeline represents [g_zoomStartMs, g_zoomEndMs].
+        auto msToPixel = [&](int64_t ms) -> int {
+            if (!g_isZoomed) {
+                return (g_tlMax > 0) ? (int)((double)ms / g_tlMax * W) : 0;
+            } else {
+                int64_t range = g_zoomEndMs - g_zoomStartMs;
+                return (range > 0) ? (int)((double)(ms - g_zoomStartMs) / range * W) : 0;
+            }
+        };
+
+        // Reserve top 14 px for time labels; thumbnails fill the rest.
+        const int labelH = 14;
+        const int thumbY = labelH;
+        const int thumbH = max(1, H - labelH);
+
+        // Draw filmstrip thumbnails (below the label strip).
+        if (g_thumbW > 0 && W > 0) {
             float slotW = (float)W / 21.0f;
             for (int i = 0; i <= 20; i++) {
-                if (!g_thumbs[i]) continue;
+                if (!thumbArr[i]) continue;
                 int x0 = (int)(i * slotW);
                 int x1 = (int)((i + 1) * slotW);
                 int sw = max(1, x1 - x0);
                 HDC srcDC = CreateCompatibleDC(memDC);
-                HBITMAP old = (HBITMAP)SelectObject(srcDC, g_thumbs[i]);
+                HBITMAP old = (HBITMAP)SelectObject(srcDC, thumbArr[i]);
                 SetStretchBltMode(memDC, HALFTONE);
                 SetBrushOrgEx(memDC, 0, 0, nullptr);
-                StretchBlt(memDC, x0, 0, sw, H, srcDC, 0, 0, g_thumbW, g_thumbH, SRCCOPY);
+                StretchBlt(memDC, x0, thumbY, sw, thumbH, srcDC, 0, 0, g_thumbW, g_thumbH, SRCCOPY);
                 SelectObject(srcDC, old);
                 DeleteDC(srcDC);
             }
         }
 
-        // Thin separator lines between thumbnail slots
+        // Time labels — draw above each thumbnail slot.
+        {
+            HFONT hLbl = CreateFontA(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+            HFONT oldFont = (HFONT)SelectObject(memDC, hLbl ? hLbl : GetStockObject(DEFAULT_GUI_FONT));
+            SetBkMode(memDC, TRANSPARENT);
+            SetTextColor(memDC, RGB(210, 210, 210));
+            float slotW = (float)W / 21.0f;
+            for (int i = 0; i <= 20; i++) {
+                double tSec = (i < 21) ? timeArr[i] : 0.0;
+                int    tTot = (int)tSec;
+                int    hh   = tTot / 3600;
+                int    mm   = (tTot % 3600) / 60;
+                int    ss   = tTot % 60;
+                char   buf[16];
+                if (hh > 0) snprintf(buf, sizeof(buf), "%d:%02d:%02d", hh, mm, ss);
+                else        snprintf(buf, sizeof(buf), "%d:%02d", mm, ss);
+                wchar_t wbuf[16];
+                MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, 16);
+                int x0 = (int)(i * slotW);
+                int x1 = (int)((i + 1) * slotW);
+                RECT tr = { x0 + 2, 0, x1 - 1, labelH };
+                DrawTextW(memDC, wbuf, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+            }
+            SelectObject(memDC, oldFont);
+            if (hLbl) DeleteObject(hLbl);
+        }
+
+        // Thin separator lines between thumbnail slots.
         if (g_thumbW > 0 && W > 0) {
             HPEN sepPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
             HPEN oldPen = (HPEN)SelectObject(memDC, sepPen);
             float slotW = (float)W / 21.0f;
             for (int i = 1; i <= 20; i++) {
                 int x = (int)(i * slotW);
-                MoveToEx(memDC, x, 0, nullptr);
+                MoveToEx(memDC, x, thumbY, nullptr);
                 LineTo(memDC, x, H);
             }
             SelectObject(memDC, oldPen);
             DeleteObject(sepPen);
         }
 
-        // Mark-in / mark-out overlays (darken excluded ranges)
+        // Mark-in / mark-out overlays (darken excluded ranges).
         if (g_tlMax > 0 && W > 0 && (g_markInMs >= 0 || g_markOutMs >= 0)) {
             HDC overDC      = CreateCompatibleDC(memDC);
             HBITMAP overBmp = CreateCompatibleBitmap(memDC, W, H);
             HBITMAP overOld = (HBITMAP)SelectObject(overDC, overBmp);
             HBRUSH darkBrush = CreateSolidBrush(RGB(0, 0, 0));
-            RECT overRc = {0, 0, W, H};
+            RECT overRc = {0, thumbY, W, H};
             FillRect(overDC, &overRc, darkBrush);
             DeleteObject(darkBrush);
             BLENDFUNCTION bf = {AC_SRC_OVER, 0, 220, 0};
             if (g_markInMs >= 0) {
-                int px = (int)((double)g_markInMs / g_tlMax * W);
-                if (px > 0) AlphaBlend(memDC, 0, 0, px, H, overDC, 0, 0, px, H, bf);
+                int px = msToPixel(g_markInMs);
+                if (px > 0) AlphaBlend(memDC, 0, thumbY, px, thumbH, overDC, 0, thumbY, px, thumbH, bf);
             }
             if (g_markOutMs >= 0) {
-                int px = (int)((double)g_markOutMs / g_tlMax * W);
-                if (px < W - 1) AlphaBlend(memDC, px + 1, 0, W - px - 1, H, overDC, px + 1, 0, W - px - 1, H, bf);
+                int px = msToPixel(g_markOutMs);
+                if (px < W - 1) AlphaBlend(memDC, px + 1, thumbY, W - px - 1, thumbH, overDC, px + 1, thumbY, W - px - 1, thumbH, bf);
             }
             SelectObject(overDC, overOld);
             DeleteObject(overBmp);
             DeleteDC(overDC);
-            // Mark-in line (violet, matches button icon colour)
             if (g_markInMs >= 0) {
-                int px = (int)((double)g_markInMs / g_tlMax * W);
+                int px = msToPixel(g_markInMs);
                 HPEN markPen = CreatePen(PS_SOLID, 2, RGB(155, 95, 255));
                 HPEN oldPen  = (HPEN)SelectObject(memDC, markPen);
-                MoveToEx(memDC, px, 0, nullptr);
-                LineTo(memDC, px, H);
-                SelectObject(memDC, oldPen);
-                DeleteObject(markPen);
+                MoveToEx(memDC, px, thumbY, nullptr); LineTo(memDC, px, H);
+                SelectObject(memDC, oldPen); DeleteObject(markPen);
             }
-            // Mark-out line (hot-pink, matches button icon colour)
             if (g_markOutMs >= 0) {
-                int px = (int)((double)g_markOutMs / g_tlMax * W);
+                int px = msToPixel(g_markOutMs);
                 HPEN markPen = CreatePen(PS_SOLID, 2, RGB(255, 75, 135));
                 HPEN oldPen  = (HPEN)SelectObject(memDC, markPen);
-                MoveToEx(memDC, px, 0, nullptr);
-                LineTo(memDC, px, H);
-                SelectObject(memDC, oldPen);
-                DeleteObject(markPen);
+                MoveToEx(memDC, px, thumbY, nullptr); LineTo(memDC, px, H);
+                SelectObject(memDC, oldPen); DeleteObject(markPen);
             }
         }
 
-        // White playhead line
+        // Playhead line.
         if (g_tlMax > 0 && W > 0) {
-            int px = (int)((double)g_tlPos / g_tlMax * W);
+            int px = msToPixel(g_tlPos);
             if (px < 0) px = 0; if (px >= W) px = W - 1;
-            HPEN headPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-            HPEN oldPen  = (HPEN)SelectObject(memDC, headPen);
-            MoveToEx(memDC, px, 0, nullptr);
-            LineTo(memDC, px, H);
-            SelectObject(memDC, oldPen);
-            DeleteObject(headPen);
+            // In zoom mode only show playhead if it's within the zoom window.
+            bool showHead = !g_isZoomed ||
+                (g_tlPos >= g_zoomStartMs && g_tlPos <= g_zoomEndMs);
+            if (showHead) {
+                HPEN headPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                HPEN oldPen  = (HPEN)SelectObject(memDC, headPen);
+                MoveToEx(memDC, px, 0, nullptr);
+                LineTo(memDC, px, H);
+                SelectObject(memDC, oldPen);
+                DeleteObject(headPen);
+            }
         }
 
-        // Atomic blit to screen
+        // Zoom mode: amber border around the timeline to indicate zoom is active.
+        if (g_isZoomed) {
+            HPEN zoomPen = CreatePen(PS_SOLID, 2, RGB(255, 200, 50));
+            HPEN oldPen  = (HPEN)SelectObject(memDC, zoomPen);
+            MoveToEx(memDC, 0, 0, nullptr);
+            LineTo(memDC, W - 1, 0);
+            LineTo(memDC, W - 1, H - 1);
+            LineTo(memDC, 0, H - 1);
+            LineTo(memDC, 0, 0);
+            SelectObject(memDC, oldPen);
+            DeleteObject(zoomPen);
+        }
+
         BitBlt(hdc, 0, 0, W, H, memDC, 0, 0, SRCCOPY);
         SelectObject(memDC, oldBmp);
         DeleteObject(memBmp);
         DeleteDC(memDC);
-
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -4719,7 +5023,12 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         g_isDragging = true;
         RECT rc; GetClientRect(hwnd, &rc);
         int x = GET_X_LPARAM(lParam);
-        g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        if (g_isZoomed) {
+            int64_t range = g_zoomEndMs - g_zoomStartMs;
+            g_tlPos = (int)(g_zoomStartMs + (double)x / max(1, rc.right) * range);
+        } else {
+            g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        }
         g_tlPos = max(0, min(g_tlPos, g_tlMax));
         InvalidateRect(hwnd, nullptr, FALSE);
         break;
@@ -4729,7 +5038,12 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (!g_isDragging) break;
         RECT rc; GetClientRect(hwnd, &rc);
         int x = GET_X_LPARAM(lParam);
-        g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        if (g_isZoomed) {
+            int64_t range = g_zoomEndMs - g_zoomStartMs;
+            g_tlPos = (int)(g_zoomStartMs + (double)x / max(1, rc.right) * range);
+        } else {
+            g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        }
         g_tlPos = max(0, min(g_tlPos, g_tlMax));
         InvalidateRect(hwnd, nullptr, FALSE);
         break;
@@ -4741,7 +5055,12 @@ LRESULT CALLBACK TimelineWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         g_isDragging = false;
         RECT rc; GetClientRect(hwnd, &rc);
         int x = GET_X_LPARAM(lParam);
-        g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        if (g_isZoomed) {
+            int64_t range = g_zoomEndMs - g_zoomStartMs;
+            g_tlPos = (int)(g_zoomStartMs + (double)x / max(1, rc.right) * range);
+        } else {
+            g_tlPos = (int)((double)x / max(1, rc.right) * g_tlMax);
+        }
         g_tlPos = max(0, min(g_tlPos, g_tlMax));
         InvalidateRect(hwnd, nullptr, FALSE);
         // Seek to final position
