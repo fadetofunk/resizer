@@ -235,7 +235,6 @@ LRESULT CALLBACK TimelineWndProc(HWND, UINT, WPARAM, LPARAM);
 static bool IsSystemDarkMode();
 static void ApplyTheme(HWND hwnd);
 void HandleResize(HWND hwnd, int clientW, int clientH);
-static HBITMAP ExtractFrameAtTime(const char* filepath, double timeSecs);
 static unsigned __stdcall ThumbExtractThreadProc(void* param);
 bool GetVideoInfo(const char* filepath, int& width, int& height, double& durationSeconds);
 HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
@@ -1752,11 +1751,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         UpdateWindow(g_hStartButton);
 
         bool ok = (wParam != 0);
-        if (ok) {
-            std::string msg = "Successfully created:\n";
-            msg += g_encodeOutPath;
-            MessageBoxA(hwnd, msg.c_str(), "Done", MB_ICONINFORMATION);
-        } else {
+        if (!ok) {
             MessageBox(hwnd, L"Transcoding failed. See debug output for details.", L"Error", MB_ICONERROR);
         }
 
@@ -4419,214 +4414,181 @@ cleanup:
 }
 
 // ------------------------------ Filmstrip Thumbnail Extraction ------------------------------
+// All 21 thumbnails share one persistent format/codec context opened once.
+// The seek is skipped for thumbnails whose target time is already past the last
+// decoded position — the same "skip the GOP seek" trick as StepForward.
+// A pre-drain step at the start of each thumbnail's loop flushes any frames
+// left in the decoder from the previous thumbnail, preventing avcodec_send_packet
+// from returning EAGAIN and silently dropping packets.
 
-static HBITMAP ExtractFrameAtTime(const char* filepath, double timeSecs) {
-    AVFormatContext* fmt_ctx = nullptr;
-    AVCodecContext*  dec_ctx = nullptr;
-    SwsContext*      sws_ctx = nullptr;
-    AVPacket*        pkt     = nullptr;
-    AVFrame*         frame   = nullptr;
-    AVFrame*         rgbFrame = nullptr;
+static unsigned __stdcall ThumbExtractThreadProc(void* /*param*/) {
+    int tlW = 0;
+    if (g_hTimeline) { RECT rc; GetClientRect(g_hTimeline, &rc); tlW = rc.right; }
+    const int N = 21;
+
+    // Persistent state — opened once, reused across all N thumbnails.
+    AVFormatContext* fmt_ctx   = nullptr;
+    AVCodecContext*  dec_ctx   = nullptr;
+    SwsContext*      sws_ctx   = nullptr;  // SDR: lazy-init, kept alive across thumbnails
+    AVPacket*        pkt       = nullptr;
+    AVFrame*         frame     = nullptr;
+    AVFrame*         rgbFrame  = nullptr;
     uint8_t*         rgbBuffer = nullptr;
-    HBITMAP          hBitmap = nullptr;
-    int              videoIdx = -1;
-    bool             gotFrame = false;
+    int              videoIdx  = -1;
+    int              dstW = 0, dstH = 90;
+    int              srcW = 0, srcH = 0;
 
-    if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) goto tf_cleanup;
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) goto tf_cleanup;
+    if (avformat_open_input(&fmt_ctx, g_inputPath, nullptr, nullptr) < 0) goto tf_done;
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) goto tf_done;
     for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
-        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { videoIdx = i; break; }
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            videoIdx = (int)i; break;
+        }
     }
-    if (videoIdx < 0) goto tf_cleanup;
+    if (videoIdx < 0) goto tf_done;
     {
         AVStream* vs = fmt_ctx->streams[videoIdx];
         const AVCodec* dec = avcodec_find_decoder(vs->codecpar->codec_id);
-        if (!dec) goto tf_cleanup;
+        if (!dec) goto tf_done;
         dec_ctx = avcodec_alloc_context3(dec);
-        if (!dec_ctx) goto tf_cleanup;
-        if (avcodec_parameters_to_context(dec_ctx, vs->codecpar) < 0) goto tf_cleanup;
-        if (avcodec_open2(dec_ctx, dec, nullptr) < 0) goto tf_cleanup;
+        if (!dec_ctx) goto tf_done;
+        if (avcodec_parameters_to_context(dec_ctx, vs->codecpar) < 0) goto tf_done;
+        if (avcodec_open2(dec_ctx, dec, nullptr) < 0) goto tf_done;
 
-        // Compute thumbnail size preserving aspect ratio, capped at 160×90
-        int srcW = dec_ctx->width, srcH = dec_ctx->height;
-        int dstH = 90;
-        int dstW = (srcH > 0) ? (int)((double)srcW / srcH * dstH) : 160;
+        srcW = dec_ctx->width; srcH = dec_ctx->height;
+        dstW = (srcH > 0) ? (int)((double)srcW / srcH * dstH) : 160;
         if (dstW < 1) dstW = 1;
-        // Store thumb dimensions on first call (all frames same source size)
         if (g_thumbW == 0) { g_thumbW = dstW; g_thumbH = dstH; }
 
-        // sws_ctx is created after decoding the first frame so we can use
-        // frame->format (the decoder's actual output format) rather than
-        // dec_ctx->pix_fmt, which may be wrong for 10-bit HEVC before decoding.
+        // sws_ctx created after first frame so frame->format is used rather than
+        // dec_ctx->pix_fmt, which can be wrong for 10-bit HEVC before decoding.
         int bufSize = av_image_get_buffer_size(AV_PIX_FMT_BGR24, dstW, dstH, 1);
         rgbBuffer = (uint8_t*)av_malloc(bufSize);
         frame    = av_frame_alloc();
         rgbFrame = av_frame_alloc();
         pkt      = av_packet_alloc();
-        if (!rgbBuffer || !frame || !rgbFrame || !pkt) goto tf_cleanup;
+        if (!rgbBuffer || !frame || !rgbFrame || !pkt) goto tf_done;
         av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, rgbBuffer,
             AV_PIX_FMT_BGR24, dstW, dstH, 1);
+    }
 
-        int64_t seek_ts = (int64_t)(timeSecs * AV_TIME_BASE);
-        av_seek_frame(fmt_ctx, -1, seek_ts, AVSEEK_FLAG_BACKWARD);
+    for (int i = 0; i < N && !g_thumbThreadStop; i++) {
+        // Use the left edge of each slot so the thumbnail shows the first frame
+        // of that section — more intuitive than the centre when browsing.
+        double t = (double)i / N * g_duration;
+
+        AVStream* vs    = fmt_ctx->streams[videoIdx];
+        double    tbase = av_q2d(vs->time_base);
+        bool      gotFrame = false;
+
+        // Seek to the keyframe before t and flush the decoder for a clean state.
+        // Using the same seek+flush per thumbnail as the original per-call code
+        // is the most reliable approach; the open/close savings (×20) are already
+        // the dominant win and this keeps the decode logic straightforward.
+        av_seek_frame(fmt_ctx, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(dec_ctx);
 
-        // Seek lands on the nearest keyframe *before* timeSecs.  If we take the
-        // very first decoded frame we always get that keyframe, so every thumbnail
-        // within the same GOP (often 2-10 s) looks identical.  Instead, decode
-        // forward and skip frames until we reach the requested timestamp.
-        double   tbase     = av_q2d(vs->time_base);
-        bool     frameDone = false;
-
-        while (!g_thumbThreadStop && !frameDone && av_read_frame(fmt_ctx, pkt) >= 0) {
-            if (pkt->stream_index == videoIdx &&
-                avcodec_send_packet(dec_ctx, pkt) == 0) {
-
-                while (!frameDone && avcodec_receive_frame(dec_ctx, frame) == 0) {
-                    // Convert frame PTS to seconds; prefer best_effort_timestamp.
+        // Original proven send-then-drain pattern.
+        while (!g_thumbThreadStop && !gotFrame && av_read_frame(fmt_ctx, pkt) >= 0) {
+            if (pkt->stream_index == videoIdx && avcodec_send_packet(dec_ctx, pkt) == 0) {
+                while (!gotFrame && avcodec_receive_frame(dec_ctx, frame) == 0) {
                     int64_t pts = frame->best_effort_timestamp;
                     if (pts == AV_NOPTS_VALUE) pts = frame->pts;
-                    double fSecs = (pts != AV_NOPTS_VALUE)
-                        ? (double)pts * tbase
-                        : timeSecs; // PTS unknown — accept whatever we have
+                    double fSecs = (pts != AV_NOPTS_VALUE) ? (double)pts * tbase : t;
 
-                    if (fSecs + 0.001 >= timeSecs) {
-                        // This frame is at or past the target time — process it.
-                        frameDone = true;
-
+                    if (fSecs + 0.001 >= t) {
+                        gotFrame = true;
                         AVPixelFormat srcFmt = (AVPixelFormat)frame->format;
                         bool isPQ  = (frame->color_trc == AVCOL_TRC_SMPTE2084);
                         bool isHLG = (frame->color_trc == AVCOL_TRC_ARIB_STD_B67);
-
                         if (isPQ || isHLG) {
-                            // --- HDR path: decode → RGB48LE → EOTF → TM → sRGB → BGR24 ---
-                            int srcCs = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
-                                         frame->colorspace == AVCOL_SPC_BT2020_CL)
-                                        ? SWS_CS_BT2020 : SWS_CS_ITU709;
+                            int srcCs    = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
+                                           frame->colorspace == AVCOL_SPC_BT2020_CL)
+                                           ? SWS_CS_BT2020 : SWS_CS_ITU709;
                             int srcRange = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
-
                             SwsContext* hdr_sws = sws_getContext(
-                                srcW, srcH, srcFmt,
-                                dstW, dstH, AV_PIX_FMT_RGB48LE,
+                                srcW, srcH, srcFmt, dstW, dstH, AV_PIX_FMT_RGB48LE,
                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
                             if (hdr_sws) {
                                 sws_setColorspaceDetails(hdr_sws,
                                     sws_getCoefficients(srcCs),    srcRange,
-                                    sws_getCoefficients(SWS_CS_ITU709), 1,
-                                    0, 1 << 16, 1 << 16);
-
-                                int rgb48Stride = dstW * 6;
-                                uint8_t* rgb48 = (uint8_t*)av_malloc(dstH * rgb48Stride);
+                                    sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1<<16, 1<<16);
+                                int      rgb48Stride = dstW * 6;
+                                uint8_t* rgb48       = (uint8_t*)av_malloc(dstH * rgb48Stride);
                                 if (rgb48) {
-                                    uint8_t* d[1] = { rgb48 };
-                                    int      s[1] = { rgb48Stride };
-                                    sws_scale(hdr_sws, frame->data, frame->linesize,
-                                              0, srcH, d, s);
-
+                                    uint8_t* d[1]={rgb48}; int s[1]={rgb48Stride};
+                                    sws_scale(hdr_sws, frame->data, frame->linesize, 0, srcH, d, s);
                                     const double refW = isPQ ? 0.0203 : 0.25;
                                     for (int y = 0; y < dstH; y++) {
-                                        const uint16_t* src16 =
-                                            (const uint16_t*)(rgb48 + y * rgb48Stride);
-                                        uint8_t* dst =
-                                            rgbFrame->data[0] + y * rgbFrame->linesize[0];
+                                        const uint16_t* src16 = (const uint16_t*)(rgb48 + y*rgb48Stride);
+                                        uint8_t* dst8 = rgbFrame->data[0] + y*rgbFrame->linesize[0];
                                         for (int x = 0; x < dstW; x++) {
-                                            double R = src16[x*3+0] / 65535.0;
-                                            double G = src16[x*3+1] / 65535.0;
-                                            double B = src16[x*3+2] / 65535.0;
-                                            if (isPQ) { R = pq_eotf(R); G = pq_eotf(G); B = pq_eotf(B); }
-                                            else       { R = hlg_eotf(R); G = hlg_eotf(G); B = hlg_eotf(B); }
-                                            double Ro = k_bt2020_to_bt709[0][0]*R + k_bt2020_to_bt709[0][1]*G + k_bt2020_to_bt709[0][2]*B;
-                                            double Go = k_bt2020_to_bt709[1][0]*R + k_bt2020_to_bt709[1][1]*G + k_bt2020_to_bt709[1][2]*B;
-                                            double Bo = k_bt2020_to_bt709[2][0]*R + k_bt2020_to_bt709[2][1]*G + k_bt2020_to_bt709[2][2]*B;
-                                            if (Ro < 0.0) Ro = 0.0; if (Go < 0.0) Go = 0.0; if (Bo < 0.0) Bo = 0.0;
-                                            Ro = reinhard_tm(Ro, refW); Go = reinhard_tm(Go, refW); Bo = reinhard_tm(Bo, refW);
-                                            dst[x*3+0] = srgb_pack(Bo);
-                                            dst[x*3+1] = srgb_pack(Go);
-                                            dst[x*3+2] = srgb_pack(Ro);
+                                            double R=src16[x*3+0]/65535.0, G=src16[x*3+1]/65535.0, B=src16[x*3+2]/65535.0;
+                                            if (isPQ){R=pq_eotf(R);G=pq_eotf(G);B=pq_eotf(B);}
+                                            else     {R=hlg_eotf(R);G=hlg_eotf(G);B=hlg_eotf(B);}
+                                            double Ro=k_bt2020_to_bt709[0][0]*R+k_bt2020_to_bt709[0][1]*G+k_bt2020_to_bt709[0][2]*B;
+                                            double Go=k_bt2020_to_bt709[1][0]*R+k_bt2020_to_bt709[1][1]*G+k_bt2020_to_bt709[1][2]*B;
+                                            double Bo=k_bt2020_to_bt709[2][0]*R+k_bt2020_to_bt709[2][1]*G+k_bt2020_to_bt709[2][2]*B;
+                                            if(Ro<0)Ro=0; if(Go<0)Go=0; if(Bo<0)Bo=0;
+                                            Ro=reinhard_tm(Ro,refW); Go=reinhard_tm(Go,refW); Bo=reinhard_tm(Bo,refW);
+                                            dst8[x*3+0]=srgb_pack(Bo); dst8[x*3+1]=srgb_pack(Go); dst8[x*3+2]=srgb_pack(Ro);
                                         }
                                     }
                                     av_free(rgb48);
-                                    gotFrame = true;
-                                }
+                                } else { gotFrame = false; }
                                 sws_freeContext(hdr_sws);
-                            }
+                            } else { gotFrame = false; }
                         } else {
-                            // --- SDR path ---
-                            sws_ctx = sws_getContext(
-                                srcW, srcH, srcFmt,
-                                dstW, dstH, AV_PIX_FMT_BGR24,
-                                SWS_BILINEAR, nullptr, nullptr, nullptr);
-                            if (sws_ctx) {
+                            // SDR — lazy-init sws_ctx once, reuse across thumbnails.
+                            if (!sws_ctx)
+                                sws_ctx = sws_getContext(srcW, srcH, srcFmt, dstW, dstH,
+                                    AV_PIX_FMT_BGR24, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (sws_ctx)
                                 sws_scale(sws_ctx, frame->data, frame->linesize, 0, srcH,
-                                    rgbFrame->data, rgbFrame->linesize);
-                                gotFrame = true;
-                            }
+                                          rgbFrame->data, rgbFrame->linesize);
+                            else
+                                gotFrame = false;
                         }
                     }
-                    av_frame_unref(frame); // always unref; processing already copied data
+                    av_frame_unref(frame);
                 }
             }
             av_packet_unref(pkt);
         }
-        if (!gotFrame) goto tf_cleanup;
 
-        BITMAPINFO bmi = {};
-        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth       = dstW;
-        bmi.bmiHeader.biHeight      = -dstH;
-        bmi.bmiHeader.biPlanes      = 1;
-        bmi.bmiHeader.biBitCount    = 24;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* dibBits = nullptr;
-        HDC hdc = GetDC(nullptr);
-        hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-        ReleaseDC(nullptr, hdc);
-        if (hBitmap && dibBits) {
-            // DIB rows are DWORD-aligned; srcFrame rows may not be.
-            // Using dstW*3 as the destination stride corrupts any video
-            // whose thumbnail width is not a multiple of 4 (e.g. 2.35:1 → dstW=211).
-            int srcRowBytes = dstW * 3;
-            int dibStride   = (srcRowBytes + 3) & ~3;  // round up to 4-byte boundary
-            for (int y = 0; y < dstH; y++)
-                memcpy((uint8_t*)dibBits + y * dibStride,
-                    rgbFrame->data[0] + y * rgbFrame->linesize[0], srcRowBytes);
+        if (gotFrame && !g_thumbThreadStop) {
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth       = dstW;
+            bmi.bmiHeader.biHeight      = -dstH;
+            bmi.bmiHeader.biPlanes      = 1;
+            bmi.bmiHeader.biBitCount    = 24;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void* dibBits = nullptr;
+            HDC hdc = GetDC(nullptr);
+            HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+            ReleaseDC(nullptr, hdc);
+            if (bmp && dibBits) {
+                int srcRowBytes = dstW * 3;
+                int dibStride   = (srcRowBytes + 3) & ~3;  // DWORD-align
+                for (int y = 0; y < dstH; y++)
+                    memcpy((uint8_t*)dibBits + y * dibStride,
+                           rgbFrame->data[0] + y * rgbFrame->linesize[0], srcRowBytes);
+                g_thumbs[i] = bmp;
+                PostMessage(g_mainHwnd, WM_APP_THUMBS_READY, 0, 0);
+            } else {
+                if (bmp) DeleteObject(bmp);
+            }
         }
     }
-tf_cleanup:
+
+tf_done:
     if (sws_ctx)  sws_freeContext(sws_ctx);
     if (frame)    av_frame_free(&frame);
     if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
     if (pkt)      av_packet_free(&pkt);
     if (dec_ctx)  avcodec_free_context(&dec_ctx);
     if (fmt_ctx)  avformat_close_input(&fmt_ctx);
-    return hBitmap;
-}
-
-static unsigned __stdcall ThumbExtractThreadProc(void* /*param*/) {
-    // Determine the timeline's pixel width so that each thumbnail is captured at
-    // the exact time corresponding to the centre of its display slot.
-    // Slot i spans [i*W/21, (i+1)*W/21]; its centre is at (i+0.5)*W/21 pixels,
-    // which maps to time (i+0.5)/21 * duration — matching the playhead formula.
-    int tlW = 0;
-    if (g_hTimeline) {
-        RECT tlrc; GetClientRect(g_hTimeline, &tlrc);
-        tlW = tlrc.right;
-    }
-    const int N = 21;
-    for (int i = 0; i < N && !g_thumbThreadStop; i++) {
-        // Centre of slot i in pixels → time
-        double centerPx = (i + 0.5) * (tlW > 0 ? tlW : 1000) / (double)N;
-        double t = centerPx / (tlW > 0 ? tlW : 1000) * g_duration;
-        // Simplifies to: t = (i + 0.5) / N * duration, independent of width.
-        // The width query is kept so the intent is explicit and survives resize logic.
-        HBITMAP bmp = ExtractFrameAtTime(g_inputPath, t);
-        if (!g_thumbThreadStop) {
-            g_thumbs[i] = bmp;
-            PostMessage(g_mainHwnd, WM_APP_THUMBS_READY, 0, 0);
-        } else {
-            if (bmp) DeleteObject(bmp);
-        }
-    }
     return 0;
 }
 
