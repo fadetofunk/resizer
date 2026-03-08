@@ -3780,15 +3780,6 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", nullptr,  nullptr, filter_graph);
 
                 if (ret >= 0) {
-                    // Build the subtitles filter string.
-                    // Path is wrapped in single quotes so colons don't need escaping;
-                    // just convert backslashes to forward slashes (both work on Windows).
-                    char esc[MAX_PATH * 2]; int k = 0;
-                    for (int j = 0; in_filename[j] && k < (int)sizeof(esc) - 2; j++) {
-                        char c = in_filename[j];
-                        esc[k++] = (c == '\\') ? '/' : c;
-                    }
-                    esc[k] = '\0';
                     // The subtitles filter si= takes 0-based index among subtitle streams,
                     // not the global stream index stored in the combo box item data.
                     int subtitle_si = 0;
@@ -3799,26 +3790,28 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     // Get Windows Fonts dir so libass can initialize its font engine
                     char windir[MAX_PATH] = {};
                     GetWindowsDirectoryA(windir, MAX_PATH);
-                    char fontspath[MAX_PATH + 8];
-                    snprintf(fontspath, sizeof(fontspath), "%s/Fonts", windir);
-                    for (int j = 0; fontspath[j]; j++)
-                        if (fontspath[j] == '\\') fontspath[j] = '/';
+                    char fontspath_raw[MAX_PATH + 8];
+                    snprintf(fontspath_raw, sizeof(fontspath_raw), "%s\\Fonts", windir);
 
-                    char filter_descr[MAX_PATH * 2 + 512];
-                    snprintf(filter_descr, sizeof(filter_descr),
-                        "subtitles='%s':si=%d:fontsdir='%s'",
-                        esc, subtitle_si, fontspath);
-
-                    AVFilterInOut* outputs = avfilter_inout_alloc();
-                    AVFilterInOut* inputs  = avfilter_inout_alloc();
-                    if (outputs && inputs) {
-                        outputs->name = av_strdup("in");  outputs->filter_ctx = buffersrc_ctx;  outputs->pad_idx = 0; outputs->next = nullptr;
-                        inputs->name  = av_strdup("out"); inputs->filter_ctx  = buffersink_ctx; inputs->pad_idx  = 0; inputs->next  = nullptr;
-                        ret = avfilter_graph_parse_ptr(filter_graph, filter_descr, &inputs, &outputs, nullptr);
-                        if (ret >= 0) ret = avfilter_graph_config(filter_graph, nullptr);
-                    }
-                    avfilter_inout_free(&outputs);
-                    avfilter_inout_free(&inputs);
+                    // Use avfilter_graph_alloc_filter + av_opt_set instead of
+                    // avfilter_graph_parse_ptr: the parse path consistently returns
+                    // EINVAL on Windows when the file path contains a drive-letter
+                    // colon (e.g. "C:/..."), even inside single quotes.
+                    const AVFilter* sub_filt = avfilter_get_by_name("subtitles");
+                    AVFilterContext* sub_ctx = sub_filt
+                        ? avfilter_graph_alloc_filter(filter_graph, sub_filt, "sub")
+                        : nullptr;
+                    if (sub_ctx) {
+                        av_opt_set    (sub_ctx->priv, "filename",     in_filename,  0);
+                        av_opt_set_int(sub_ctx->priv, "stream_index", subtitle_si,  0);
+                        av_opt_set    (sub_ctx->priv, "fontsdir",     fontspath_raw, 0);
+                        int init_ret = avfilter_init_str(sub_ctx, nullptr);
+                        if (init_ret >= 0 &&
+                            avfilter_link(buffersrc_ctx, 0, sub_ctx, 0) == 0 &&
+                            avfilter_link(sub_ctx, 0, buffersink_ctx, 0) == 0) {
+                            ret = avfilter_graph_config(filter_graph, nullptr);
+                        } else { ret = (init_ret < 0) ? init_ret : AVERROR(EINVAL); }
+                    } else { ret = AVERROR(ENOSYS); }
                     if (ret >= 0) {
                         use_filter = true;
                     } else {
