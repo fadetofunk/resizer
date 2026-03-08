@@ -12,6 +12,7 @@ EXPORTS
     av_buffersink_get_sample_aspect_ratio
     av_buffersink_get_sample_rate
     av_buffersink_get_samples
+    av_buffersink_get_side_data
     av_buffersink_get_time_base
     av_buffersink_get_type
     av_buffersink_get_w
@@ -25,7 +26,6 @@ EXPORTS
     av_buffersrc_write_frame
     av_filter_ffversion
     av_filter_iterate
-    avfilter_config_links
     avfilter_configuration
     avfilter_filter_pad_count
     avfilter_free
@@ -59,7 +59,7 @@ EXPORTS
     avfilter_insert_filter
     avfilter_license
     avfilter_link
-    avfilter_link_free
+    avfilter_link_get_hw_frames_ctx
     avfilter_pad_get_name
     avfilter_pad_get_type
     avfilter_process_command

@@ -3075,6 +3075,12 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     AVFilterContext*  buffersink_ctx   = nullptr;
     bool              use_filter       = false;
     bool              use_bitmap_subs  = false;
+    char              ext_sub_tmp[MAX_PATH]        = {}; // temp copy of the subtitle file at a plain ASCII path
+    char              ext_sub_filter_path[MAX_PATH] = {}; // path used in filter (for lazy format-mismatch reinit)
+    bool              ext_sub_fmt_fixed             = false; // true after one lazy reinit attempt
+    AVFrame*          pre_filter_frame              = nullptr; // YUV420P staging frame for subtitle filter
+    SwsContext*       pre_filter_sws                = nullptr; // NV12/P010/etc → YUV420P for filter input
+
     int               pgs_plane_w      = 0;   // subtitle coordinate space (may differ from video for 4K)
     int               pgs_plane_h      = 0;
     std::vector<PgsEvent>    pgs_events;
@@ -3456,8 +3462,35 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         }
     }
 
-    // External subtitle file (.srt/.ass/.ssa alongside the video) — set up filter directly.
+    // External subtitle file (.srt/.ass/.ssa alongside the video).
+    // libass silently fails to open files whose paths contain special characters
+    // (spaces, !!, non-ASCII).  Fix: copy the file into a temp path with a plain
+    // ASCII name before passing it to the filter.  This preserves all styling
+    // (ASS overrides, fonts, etc.) because libass reads the actual file content.
     if (ext_subtitle_path && ext_subtitle_path[0] && !use_bitmap_subs) {
+        {
+            char tmp_dir[MAX_PATH] = {}, tmp_base[MAX_PATH] = {};
+            GetTempPathA(MAX_PATH, tmp_dir);
+            if (GetTempFileNameA(tmp_dir, "sub", 0, tmp_base)) {
+                DeleteFileA(tmp_base); // GetTempFileName creates a placeholder; replace it
+                const char* orig_dot = strrchr(ext_subtitle_path, '.');
+                snprintf(ext_sub_tmp, MAX_PATH, "%s%s", tmp_base, orig_dot ? orig_dot : ".srt");
+                FILE* fi = nullptr; FILE* fo = nullptr;
+                fopen_s(&fi, ext_subtitle_path, "rb");
+                fopen_s(&fo, ext_sub_tmp,        "wb");
+                if (fi && fo) {
+                    char chunk[65536]; size_t n;
+                    while ((n = fread(chunk, 1, sizeof(chunk), fi)) > 0) fwrite(chunk, 1, n, fo);
+                }
+                if (fo) fclose(fo);
+                if (fi) fclose(fi);
+            }
+        }
+        // Use the temp copy if it was created, otherwise fall back to the original path.
+        const char* sub_path_for_filter = ext_sub_tmp[0] ? ext_sub_tmp : ext_subtitle_path;
+        // Store for the lazy format-mismatch reinit in the encode loop.
+        StringCchCopyA(ext_sub_filter_path, MAX_PATH, sub_path_for_filter);
+
         const AVFilter* buffersrc  = avfilter_get_by_name("buffer");
         const AVFilter* buffersink = avfilter_get_by_name("buffersink");
         if (buffersrc && buffersink) {
@@ -3466,13 +3499,14 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 char src_args[256];
                 AVRational tb  = video_in_stream->time_base;
                 AVRational sar = dec_ctx->sample_aspect_ratio;
+                // The buffersrc is configured for YUV420P.  Frames that arrive in a
+                // different format (e.g. NV12 from NVDEC) are converted to YUV420P
+                // explicitly in the encode loop before being pushed to the filter.
                 AVPixelFormat filter_fmt;
                 if (using_hw && dec_ctx->hw_frames_ctx)
                     filter_fmt = ((AVHWFramesContext*)dec_ctx->hw_frames_ctx->data)->sw_format;
-                else if (using_hw)
-                    filter_fmt = (AVPixelFormat)video_in_stream->codecpar->format;
                 else
-                    filter_fmt = dec_ctx->pix_fmt;
+                    filter_fmt = AV_PIX_FMT_YUV420P;
                 snprintf(src_args, sizeof(src_args),
                     "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
                     dec_ctx->width, dec_ctx->height, (int)filter_fmt,
@@ -3481,31 +3515,33 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 if (ret >= 0)
                     ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", nullptr,  nullptr, filter_graph);
                 if (ret >= 0) {
-                    char esc[MAX_PATH * 2]; int k = 0;
-                    for (int j = 0; ext_subtitle_path[j] && k < (int)sizeof(esc)-2; j++) {
-                        char c = ext_subtitle_path[j];
-                        esc[k++] = (c == '\\') ? '/' : c;
-                    }
-                    esc[k] = '\0';
+                    // Build the subtitle filter directly (no avfilter_graph_parse_ptr).
+                    // avfilter_graph_parse_ptr consistently returns EINVAL when the path
+                    // contains colons (drive letters) even inside single quotes.
+                    // Using av_opt_set bypasses all string-escaping issues entirely.
                     char windir[MAX_PATH] = {};
                     GetWindowsDirectoryA(windir, MAX_PATH);
-                    char fontspath[MAX_PATH + 8];
-                    snprintf(fontspath, sizeof(fontspath), "%s/Fonts", windir);
-                    for (int j = 0; fontspath[j]; j++)
-                        if (fontspath[j] == '\\') fontspath[j] = '/';
-                    char filter_descr[MAX_PATH * 2 + 256];
-                    snprintf(filter_descr, sizeof(filter_descr),
-                        "subtitles='%s':fontsdir='%s'", esc, fontspath);
-                    AVFilterInOut* outputs = avfilter_inout_alloc();
-                    AVFilterInOut* inputs  = avfilter_inout_alloc();
-                    if (outputs && inputs) {
-                        outputs->name = av_strdup("in");  outputs->filter_ctx = buffersrc_ctx;  outputs->pad_idx = 0; outputs->next = nullptr;
-                        inputs->name  = av_strdup("out"); inputs->filter_ctx  = buffersink_ctx; inputs->pad_idx  = 0; inputs->next  = nullptr;
-                        ret = avfilter_graph_parse_ptr(filter_graph, filter_descr, &inputs, &outputs, nullptr);
-                        if (ret >= 0) ret = avfilter_graph_config(filter_graph, nullptr);
-                    }
-                    avfilter_inout_free(&outputs);
-                    avfilter_inout_free(&inputs);
+                    char fontspath_raw[MAX_PATH + 8];
+                    snprintf(fontspath_raw, sizeof(fontspath_raw), "%s\\Fonts", windir);
+
+                    const AVFilter* sub_filt = avfilter_get_by_name("subtitles");
+                    // avfilter_graph_create_filter calls init() immediately (before we can
+                    // set options), so filename is null and init rejects it.
+                    // Use alloc_filter + av_opt_set + avfilter_init_str instead:
+                    // alloc_filter creates the context without calling init().
+                    AVFilterContext* sub_ctx = sub_filt
+                        ? avfilter_graph_alloc_filter(filter_graph, sub_filt, "sub")
+                        : nullptr;
+                    if (sub_ctx) {
+                        av_opt_set(sub_ctx->priv, "filename", sub_path_for_filter, 0);
+                        av_opt_set(sub_ctx->priv, "fontsdir", fontspath_raw, 0);
+                        int init_ret = avfilter_init_str(sub_ctx, nullptr);
+                        if (init_ret >= 0 &&
+                            avfilter_link(buffersrc_ctx, 0, sub_ctx, 0) == 0 &&
+                            avfilter_link(sub_ctx, 0, buffersink_ctx, 0) == 0) {
+                            ret = avfilter_graph_config(filter_graph, nullptr);
+                        } else { ret = (init_ret < 0) ? init_ret : AVERROR(EINVAL); }
+                    } else { ret = AVERROR(ENOSYS); }
                     if (ret >= 0) {
                         use_filter = true;
                     } else {
@@ -3545,7 +3581,10 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                                                         std::string txt2;
                                                         if (r2->type == SUBTITLE_ASS && r2->ass) {
                                                             const char* p2 = r2->ass;
-                                                            for (int nc = 0; *p2 && nc < 9; p2++) if (*p2 == ',') nc++;
+                                                            // FFmpeg ≥6 omits "Dialogue: " prefix from r->ass; the text field is
+// then the 9th field (8 commas) instead of the 10th (9 commas).
+{ int _skip = (p2[0]=='D'&&p2[1]=='i'&&p2[2]=='a') ? 9 : 8;
+  for (int nc = 0; *p2 && nc < _skip; p2++) if (*p2 == ',') nc++; }
                                                             txt2 = p2;
                                                         } else if (r2->type == SUBTITLE_TEXT && r2->text) {
                                                             for (const char* p2 = r2->text; *p2; p2++) {
@@ -3816,9 +3855,12 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                                                         AVSubtitleRect* r2 = sub2.rects[ri];
                                                         std::string txt2;
                                                         if (r2->type == SUBTITLE_ASS && r2->ass) {
-                                                            // Full Dialogue line: skip first 9 commas to get Text field
+                                                            // Skip commas to reach the Text field (8 for new FFmpeg, 9 for old).
                                                             const char* p2 = r2->ass;
-                                                            for (int nc = 0; *p2 && nc < 9; p2++) if (*p2 == ',') nc++;
+                                                            // FFmpeg ≥6 omits "Dialogue: " prefix from r->ass; the text field is
+// then the 9th field (8 commas) instead of the 10th (9 commas).
+{ int _skip = (p2[0]=='D'&&p2[1]=='i'&&p2[2]=='a') ? 9 : 8;
+  for (int nc = 0; *p2 && nc < _skip; p2++) if (*p2 == ',') nc++; }
                                                             txt2 = p2;
                                                         } else if (r2->type == SUBTITLE_TEXT && r2->text) {
                                                             for (const char* p2 = r2->text; *p2; p2++) {
@@ -4099,10 +4141,38 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                 AVFrame* filter_out = nullptr;
                 if (use_filter) {
                     sw_frame->pts = in_pts; // filter needs original pts for subtitle timing
-                    if (av_buffersrc_add_frame_flags(buffersrc_ctx, sw_frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+
+                    // The subtitles filter only accepts planar YUV.  NVDEC gives NV12 (semi-planar),
+                    // so convert to YUV420P with a dedicated sws context before pushing to the filter.
+                    AVFrame* filt_input = sw_frame;
+                    if ((AVPixelFormat)sw_frame->format != AV_PIX_FMT_YUV420P) {
+                        if (!pre_filter_sws)
+                            pre_filter_sws = sws_getContext(
+                                sw_frame->width, sw_frame->height, (AVPixelFormat)sw_frame->format,
+                                sw_frame->width, sw_frame->height, AV_PIX_FMT_YUV420P,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        if (!pre_filter_frame) {
+                            pre_filter_frame = av_frame_alloc();
+                            if (pre_filter_frame) {
+                                pre_filter_frame->format = AV_PIX_FMT_YUV420P;
+                                pre_filter_frame->width  = sw_frame->width;
+                                pre_filter_frame->height = sw_frame->height;
+                                av_frame_get_buffer(pre_filter_frame, 32);
+                            }
+                        }
+                        if (pre_filter_sws && pre_filter_frame) {
+                            sws_scale(pre_filter_sws,
+                                (const uint8_t* const*)sw_frame->data, sw_frame->linesize,
+                                0, sw_frame->height,
+                                pre_filter_frame->data, pre_filter_frame->linesize);
+                            pre_filter_frame->pts = sw_frame->pts;
+                            filt_input = pre_filter_frame;
+                        }
+                    }
+
+                    if (av_buffersrc_add_frame_flags(buffersrc_ctx, filt_input, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
                         filter_out = av_frame_alloc();
                         int fret = filter_out ? av_buffersink_get_frame(buffersink_ctx, filter_out) : AVERROR(ENOMEM);
-                        // EAGAIN means the filter needs more frames — not an error, just use original
                         if (fret < 0) { av_frame_free(&filter_out); filter_out = nullptr; }
                         else { src_frame = filter_out; }
                     }
@@ -4320,7 +4390,12 @@ flush_encoder:
     av_write_trailer(out_fmt_ctx);
     success = true;
 
+
+
 cleanup:
+    if (ext_sub_tmp[0]) DeleteFileA(ext_sub_tmp);
+    if (pre_filter_frame) av_frame_free(&pre_filter_frame);
+    if (pre_filter_sws)   sws_freeContext(pre_filter_sws);
     if (trans_bsf_pkt) av_packet_free(&trans_bsf_pkt);
     if (trans_bsf_ctx) av_bsf_free(&trans_bsf_ctx);
     if (filter_graph) avfilter_graph_free(&filter_graph);
