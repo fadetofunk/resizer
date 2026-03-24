@@ -81,6 +81,9 @@ extern "C" {
 #define IDT_UI_REFRESH            3001
 #define IDT_ENCODE_PROGRESS       3002
 
+#define IDM_ABOUT                 9001
+#define APP_VERSION               L"1.9"
+
 #define WM_APP_THUMBS_READY  (WM_APP + 3)
 #define WM_APP_ENCODE_DONE   (WM_APP + 4)
 
@@ -1233,6 +1236,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Restore saved settings from the registry
         LoadSettings();
 
+        // Add "About" to the system menu (right-click title bar)
+        {
+            HMENU hSys = GetSystemMenu(hwnd, FALSE);
+            AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hSys, MF_STRING, IDM_ABOUT, L"About Resizer...");
+        }
+
         break;
     }
 
@@ -1883,6 +1893,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         EndPaint(hwnd, &ps);
         break;
     }
+
+    case WM_SYSCOMMAND:
+        if (wParam == IDM_ABOUT) {
+            MessageBoxW(hwnd,
+                L"Resizer  v" APP_VERSION L"\n\n"
+                L"Video transcoder — resize clips to a target file size.\n\n"
+                L"Built with FFmpeg.",
+                L"About Resizer",
+                MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
 
     case WM_DESTROY:
         SaveSettings();
