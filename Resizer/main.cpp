@@ -28,9 +28,12 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <process.h>
+<<<<<<< Updated upstream
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 #include <deque>
+=======
+>>>>>>> Stashed changes
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -42,15 +45,21 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
+<<<<<<< Updated upstream
 #include <libswresample/swresample.h>
+=======
+>>>>>>> Stashed changes
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 }
 
+<<<<<<< Updated upstream
 // ------------------------------ Resource IDs ------------------------------
 #define IDI_APPICON                  101
 
+=======
+>>>>>>> Stashed changes
 // ------------------------------ Control IDs ------------------------------
 #define IDC_INFO_STATIC           1001
 #define IDC_SIZE_STATIC           1002
@@ -74,6 +83,7 @@ extern "C" {
 #define IDC_BTN_BACK              2004
 #define IDC_BTN_MARKIN            2005
 #define IDC_BTN_MARKOUT           2006
+<<<<<<< Updated upstream
 #define IDC_BTN_GOTO_MARKIN       2007
 #define IDC_BTN_GOTO_MARKOUT      2008
 #define IDC_BTN_ZOOM              2009
@@ -105,6 +115,10 @@ extern "C" {
 #define IDC_SAVE_BROWSE_BTN       2025
 #define IDC_GRP_COLOR             2026
 #define IDC_COLOR_DROP            2027
+=======
+
+#define IDT_UI_REFRESH            3001
+>>>>>>> Stashed changes
 
 // ------------------------------ Globals ------------------------------
 #define WM_APP_FRAME_READY (WM_APP + 1)
@@ -133,6 +147,7 @@ static HWND     g_hHalfRadio = nullptr;
 static HWND     g_hQuarterRadio = nullptr;
 static HWND     g_hStartButton = nullptr;
 
+<<<<<<< Updated upstream
 static HWND     g_hTimeline = nullptr;   // custom filmstrip seekbar
 static int      g_tlPos     = 0;         // current position in ms
 static int      g_tlMax     = 1000;      // duration in ms
@@ -142,11 +157,15 @@ static HBITMAP  g_thumbs[21] = {};       // filmstrip thumbnails (0%..100% in 5%
 static int      g_thumbW = 0, g_thumbH = 0;
 static HANDLE   g_thumbThread   = nullptr;
 static volatile bool g_thumbThreadStop = false;
+=======
+static HWND     g_hSeekbar = nullptr;
+>>>>>>> Stashed changes
 static HWND     g_hBtnPlayPause = nullptr;
 static HWND     g_hBtnFwd = nullptr;
 static HWND     g_hBtnBack = nullptr;
 static HWND     g_hBtnMarkIn = nullptr;
 static HWND     g_hBtnMarkOut = nullptr;
+<<<<<<< Updated upstream
 static HWND     g_hBtnGotoMarkIn  = nullptr;
 static HWND     g_hBtnGotoMarkOut = nullptr;
 static int64_t  g_markInMs  = -1;   // -1 = not set
@@ -223,6 +242,8 @@ static bool     g_darkMode  = false;
 static AppTheme g_theme     = {};
 static HBRUSH   g_hBkBrush  = nullptr;   // window background brush
 static HBRUSH   g_hEditBrush = nullptr;  // edit control background brush
+=======
+>>>>>>> Stashed changes
 
 static HBITMAP  g_hFrameBitmap = nullptr;
 static int      g_frameWidth = 0;
@@ -230,7 +251,10 @@ static int      g_frameHeight = 0;
 
 static HANDLE   g_hPlaybackThread = nullptr;
 static CRITICAL_SECTION g_csState;
+<<<<<<< Updated upstream
 static CRITICAL_SECTION g_csMarkCache;
+=======
+>>>>>>> Stashed changes
 static volatile bool g_playThreadShouldExit = false;
 static volatile bool g_isPlaying = false;
 static volatile bool g_seekRequested = false;
@@ -239,6 +263,7 @@ static volatile int64_t g_currentPosMs = 0;
 static volatile bool g_decodeSingleFrame = false;
 static double   g_videoFPS = 30.0;
 static bool     g_playerReady = false;
+<<<<<<< Updated upstream
 static volatile int  g_stepDir = 0; // +1 forward, -1 backward
 static volatile bool g_stepFileReady = false; // thread file ptr is right after last step-decoded frame
 static bool          g_isDragging   = false; // true while user drags the seekbar thumb
@@ -264,6 +289,19 @@ static void PopulateAudioAndSubsDropdowns(const char* filepath);
 static void ScanExternalSubtitles(const char* videoPath);
 static void DetectHdr(const char* filepath);
 
+=======
+static bool     g_isInterlaced = false;
+static volatile int g_stepDir = 0; // +1 forward, -1 backward
+
+// Forward declarations
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+void HandleResize(HWND hwnd, int clientW, int clientH);
+bool GetVideoInfo(const char* filepath, int& width, int& height, double& durationSeconds);
+HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration);
+bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
+    int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds);
+
+>>>>>>> Stashed changes
 // Playback helpers
 unsigned __stdcall PlaybackThreadProc(void*);
 void StartPlayback(HWND hwnd);
@@ -271,14 +309,18 @@ void StopPlayback();
 void TogglePlayPause(HWND hwnd);
 void EnsureThreadRunningPaused(HWND hwnd);
 void SeekMs(int64_t ms, bool decodeSingle);
+<<<<<<< Updated upstream
 static bool IsXvidAvi(const char* filepath);
 static bool RemuxXvidToMp4(const char* in_path, const char* out_path);
+=======
+>>>>>>> Stashed changes
 void StepForward(HWND hwnd);
 void StepBackward(HWND hwnd);
 void UpdateSeekbarFromPos();
 void SetMarkInFromCurrent(HWND hwnd);
 void SetMarkOutFromCurrent(HWND hwnd);
 
+<<<<<<< Updated upstream
 // ------------------------------ NVIDIA Hardware Acceleration ------------------------------
 static const char* get_cuvid_name(AVCodecID id) {
     switch (id) {
@@ -351,6 +393,8 @@ static unsigned __stdcall EncodeThreadProc(void* param) {
     return 0;
 }
 
+=======
+>>>>>>> Stashed changes
 // ------------------------------ UI Layout ------------------------------
 void HandleResize(HWND hwnd, int clientW, int clientH) {
     const int M      = 10;  // outer margin
@@ -362,6 +406,7 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     const int lColW  = (totalW - colGap) * 3 / 5;   // ~60% — left column groups
     const int rColW  = totalW - colGap - lColW;       // ~40% — right column groups
 
+<<<<<<< Updated upstream
     int y = M;
 
     // Info bar – always at top, full width
@@ -372,6 +417,9 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     int settingsH = GH + P + RH + 5 + RH + 5 + RH + P;
     MoveWindow(g_hGrpSettings, M,                  y, lColW, settingsH, TRUE);
     MoveWindow(g_hGrpSaveLoc,  M + lColW + colGap, y, rColW, settingsH, TRUE);
+=======
+    int labelHeightSize;
+>>>>>>> Stashed changes
     {
         int ix = M + P, iy = y + GH;
         int lw = 130;
@@ -385,6 +433,12 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         MoveWindow(g_hResStatic,    ix,          iy, lw, RH, TRUE);
         MoveWindow(g_hResDrop,      ix + lw + 6, iy, ew, RH, TRUE);
     }
+<<<<<<< Updated upstream
+=======
+
+    int ySuffix = margin + labelHeightSize + margin;
+    int labelHeightSuffix;
+>>>>>>> Stashed changes
     {
         int sx     = M + lColW + colGap + P;
         int iy     = y + GH;
@@ -400,6 +454,7 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     }
     y += settingsH + M;
 
+<<<<<<< Updated upstream
     // === Range (left) + Color Space (right) ===
     int rangeH = GH + P + RH + P;
     MoveWindow(g_hGrpRange, M,                  y, lColW, rangeH, TRUE);
@@ -419,6 +474,47 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
         MoveWindow(g_hStartEdit,   midLeft + labelW,                 iy, editW,  RH, TRUE);
         MoveWindow(g_hEndStatic,   midLeft + labelW + editW + 8,     iy, labelW, RH, TRUE);
         MoveWindow(g_hEndEdit,     midLeft + labelW * 2 + editW + 8, iy, editW,  RH, TRUE);
+=======
+    int yRange = ySuffix + labelHeightSuffix + margin;
+    MoveWindow(g_hRangeFullRadio, margin, yRange, 120, 20, TRUE);
+    MoveWindow(g_hRangeCustomRadio, margin + 140, yRange, 120, 20, TRUE);
+    MoveWindow(g_hStartStatic, margin + 280, yRange, 100, 20, TRUE);
+    MoveWindow(g_hStartEdit, margin + 380, yRange, 80, 20, TRUE);
+    MoveWindow(g_hEndStatic, margin + 480, yRange, 100, 20, TRUE);
+    MoveWindow(g_hEndEdit, margin + 580, yRange, 80, 20, TRUE);
+
+    int yRes = yRange + 30;
+    MoveWindow(g_hFullRadio, margin, yRes, 300, 20, TRUE);
+    MoveWindow(g_hHalfRadio, margin, yRes + 25, 300, 20, TRUE);
+    MoveWindow(g_hQuarterRadio, margin, yRes + 50, 300, 20, TRUE);
+
+    int btnY = yRes + 75;
+    MoveWindow(g_hStartButton, margin, btnY, 150, 30, TRUE);
+
+    int yPlayer = btnY + 40;
+    int btnW = 90, btnH = 26;
+    MoveWindow(g_hBtnPlayPause, margin, yPlayer, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnBack, margin + btnW + 6, yPlayer, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnFwd, margin + (btnW + 6) * 2, yPlayer, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnMarkIn, margin + (btnW + 6) * 3 + 20, yPlayer, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnMarkOut, margin + (btnW + 6) * 4 + 20, yPlayer, btnW, btnH, TRUE);
+
+    int sbX = margin;
+    int sbY = yPlayer + btnH + 8;
+    int sbW = clientW - margin * 2;
+    MoveWindow(g_hSeekbar, sbX, sbY, sbW, 28, TRUE);
+
+    if (g_hFrameBitmap) {
+        HDC hdc = GetDC(hwnd);
+        HFONT hFont = (HFONT)SendMessage(g_hInfoStatic, WM_GETFONT, 0, 0);
+        SelectObject(hdc, hFont);
+        wchar_t buf[512];
+        GetWindowTextW(g_hInfoStatic, buf, ARRAYSIZE(buf));
+        SIZE sz;
+        GetTextExtentPoint32W(hdc, buf, lstrlenW(buf), &sz);
+        ReleaseDC(hwnd, hdc);
+        MoveWindow(g_hInfoStatic, margin, sbY + 28 + 6, sz.cx, sz.cy, TRUE);
+>>>>>>> Stashed changes
     }
     {
         int cx     = M + lColW + colGap + P;
@@ -428,6 +524,7 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     }
     y += rangeH + M;
 
+<<<<<<< Updated upstream
     // === Audio & Subtitles (2 rows) ===
     int mediaH = GH + P + RH + 5 + RH + P;
     MoveWindow(g_hGrpMedia, M, y, totalW, mediaH, TRUE);
@@ -470,16 +567,21 @@ void HandleResize(HWND hwnd, int clientW, int clientH) {
     g_videoTop = y + 32 + M;  // video preview starts below the start button
 
     // frame preview fills remaining client area below the start button
+=======
+>>>>>>> Stashed changes
     InvalidateRect(hwnd, nullptr, TRUE);
 }
 
 // ------------------------------ App Entry ------------------------------
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+<<<<<<< Updated upstream
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     Gdiplus::GdiplusStartupInput gdiplusInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
 
+=======
+>>>>>>> Stashed changes
     INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icex);
 
@@ -518,9 +620,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return 0;
     }
 
+<<<<<<< Updated upstream
     ApplyTheme(g_mainHwnd);   // sets colours and dark title bar before first paint
     InitializeCriticalSection(&g_csState);
     InitializeCriticalSection(&g_csMarkCache);
+=======
+    InitializeCriticalSection(&g_csState);
+>>>>>>> Stashed changes
 
     ShowWindow(g_mainHwnd, nCmdShow);
     UpdateWindow(g_mainHwnd);
@@ -532,6 +638,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     DeleteCriticalSection(&g_csState);
+<<<<<<< Updated upstream
     DeleteCriticalSection(&g_csMarkCache);
     if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CoUninitialize();
@@ -1005,12 +1112,18 @@ static void SaveSettings() {
     RegCloseKey(hk);
 }
 
+=======
+    return (int)msg.wParam;
+}
+
+>>>>>>> Stashed changes
 // ------------------------------ Window Proc ------------------------------
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         DragAcceptFiles(hwnd, TRUE);
 
+<<<<<<< Updated upstream
         // Create UI font from system metrics (Segoe UI on modern Windows)
         {
             NONCLIENTMETRICSW ncm = {};
@@ -1290,6 +1403,82 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
         if (dis->CtlType == ODT_BUTTON) { DrawPlayerButton(dis); return TRUE; }
+=======
+        g_hInfoStatic = CreateWindowEx(0, L"STATIC", L"Drop a video file onto this window",
+            WS_CHILD | WS_VISIBLE, 10, 10, 240, 20, hwnd,
+            (HMENU)IDC_INFO_STATIC, GetModuleHandle(nullptr), nullptr);
+
+        g_hSizeStatic = CreateWindowEx(0, L"STATIC", L"Target size (MB):",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 10, 40, 100, 20, hwnd,
+            (HMENU)IDC_SIZE_STATIC, GetModuleHandle(nullptr), nullptr);
+        g_hSizeEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | ES_NUMBER,
+            120, 40, 200, 20, hwnd, (HMENU)IDC_SIZE_EDIT, GetModuleHandle(nullptr), nullptr);
+
+        g_hSuffixStatic = CreateWindowEx(0, L"STATIC", L"Suffix:",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 10, 70, 60, 20, hwnd,
+            (HMENU)IDC_SUFFIX_STATIC, GetModuleHandle(nullptr), nullptr);
+        g_hSuffixEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"RESIZED",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 80, 70, 200, 20, hwnd,
+            (HMENU)IDC_SUFFIX_EDIT, GetModuleHandle(nullptr), nullptr);
+
+        g_hRangeFullRadio = CreateWindowEx(0, L"BUTTON", L"Full video",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON | WS_GROUP,
+            10, 100, 120, 20, hwnd, (HMENU)IDC_RANGE_FULL_RADIO, GetModuleHandle(nullptr), nullptr);
+        g_hRangeCustomRadio = CreateWindowEx(0, L"BUTTON", L"Custom range",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON,
+            150, 100, 120, 20, hwnd, (HMENU)IDC_RANGE_CUSTOM_RADIO, GetModuleHandle(nullptr), nullptr);
+
+        g_hStartStatic = CreateWindowEx(0, L"STATIC", L"Start time (s):",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 290, 100, 100, 20, hwnd,
+            (HMENU)IDC_START_STATIC, GetModuleHandle(nullptr), nullptr);
+        g_hStartEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"0",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | ES_NUMBER,
+            390, 100, 80, 20, hwnd, (HMENU)IDC_START_EDIT, GetModuleHandle(nullptr), nullptr);
+        g_hEndStatic = CreateWindowEx(0, L"STATIC", L"End time (s):",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 480, 100, 100, 20, hwnd,
+            (HMENU)IDC_END_STATIC, GetModuleHandle(nullptr), nullptr);
+        g_hEndEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | ES_NUMBER,
+            580, 100, 80, 20, hwnd, (HMENU)IDC_END_EDIT, GetModuleHandle(nullptr), nullptr);
+
+        g_hFullRadio = CreateWindowEx(0, L"BUTTON", L"Full resolution",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON | WS_GROUP,
+            10, 130, 300, 20, hwnd, (HMENU)IDC_SCALE_FULL_RADIO, GetModuleHandle(nullptr), nullptr);
+        g_hHalfRadio = CreateWindowEx(0, L"BUTTON", L"Half resolution",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON,
+            10, 155, 300, 20, hwnd, (HMENU)IDC_SCALE_HALF_RADIO, GetModuleHandle(nullptr), nullptr);
+        g_hQuarterRadio = CreateWindowEx(0, L"BUTTON", L"Quarter resolution",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_AUTORADIOBUTTON,
+            10, 180, 300, 20, hwnd, (HMENU)IDC_SCALE_QUARTER_RADIO, GetModuleHandle(nullptr), nullptr);
+
+        g_hStartButton = CreateWindowEx(0, L"BUTTON", L"Start Processing",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_DEFPUSHBUTTON,
+            10, 210, 150, 30, hwnd, (HMENU)IDC_START_BUTTON, GetModuleHandle(nullptr), nullptr);
+
+        g_hBtnPlayPause = CreateWindowEx(0, L"BUTTON", L"Play",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 10, 250, 90, 26, hwnd,
+            (HMENU)IDC_BTN_PLAYPAUSE, GetModuleHandle(nullptr), nullptr);
+        g_hBtnBack = CreateWindowEx(0, L"BUTTON", L"Frame Back",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 110, 250, 90, 26, hwnd,
+            (HMENU)IDC_BTN_BACK, GetModuleHandle(nullptr), nullptr);
+        g_hBtnFwd = CreateWindowEx(0, L"BUTTON", L"Frame Fwd",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 210, 250, 90, 26, hwnd,
+            (HMENU)IDC_BTN_FWD, GetModuleHandle(nullptr), nullptr);
+        g_hBtnMarkIn = CreateWindowEx(0, L"BUTTON", L"Mark In",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 330, 250, 90, 26, hwnd,
+            (HMENU)IDC_BTN_MARKIN, GetModuleHandle(nullptr), nullptr);
+        g_hBtnMarkOut = CreateWindowEx(0, L"BUTTON", L"Mark Out",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 430, 250, 90, 26, hwnd,
+            (HMENU)IDC_BTN_MARKOUT, GetModuleHandle(nullptr), nullptr);
+        g_hSeekbar = CreateWindowEx(0, TRACKBAR_CLASS, L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | TBS_AUTOTICKS,
+            10, 285, 600, 28, hwnd, (HMENU)IDC_SEEKBAR, GetModuleHandle(nullptr), nullptr);
+        SendMessage(g_hSeekbar, TBM_SETRANGEMIN, TRUE, 0);
+        SendMessage(g_hSeekbar, TBM_SETRANGEMAX, TRUE, 1000);
+        SendMessage(g_hSeekbar, TBM_SETPAGESIZE, 0, 100);
+
+>>>>>>> Stashed changes
         break;
     }
 
@@ -1312,8 +1501,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 wchar_t infoText[512];
                 double minutes = floor(g_duration / 60.0);
                 double seconds = g_duration - minutes * 60.0;
+<<<<<<< Updated upstream
                 StringCchPrintfW(infoText, 512, L"%S   (%.0f:%02.0f)   %dx%d",
                     g_inputPath, minutes, seconds, g_vidWidth, g_vidHeight);
+=======
+                StringCchPrintfW(infoText, 512, L"%S   (%.0f:%02.0f)   %dx%d%s",
+                    g_inputPath, minutes, seconds, g_vidWidth, g_vidHeight,
+                    g_isInterlaced ? L"   [Interlaced]" : L"");
+>>>>>>> Stashed changes
                 SetWindowTextW(g_hInfoStatic, infoText);
 
                 int fullW = g_vidWidth, fullH = g_vidHeight;
@@ -1395,6 +1590,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetWindowTextW(g_hStartEdit, startBuf);
                 SetWindowTextW(g_hEndEdit, endBuf);
 
+<<<<<<< Updated upstream
                 g_tlMax = (int)(g_duration * 1000);
                 g_tlPos = 0;
                 g_tlEnabled = true;
@@ -1412,12 +1608,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 g_zoomThumbStop = false;
                 InvalidateRect(g_hTimeline, nullptr, TRUE);
+=======
+                SendMessage(g_hSeekbar, TBM_SETRANGEMIN, TRUE, 0);
+                SendMessage(g_hSeekbar, TBM_SETRANGEMAX, TRUE, (LPARAM)(int)(g_duration * 1000));
+                SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, 0);
+                EnableWindow(g_hSeekbar, TRUE);
+>>>>>>> Stashed changes
 
                 EnableWindow(g_hBtnPlayPause, TRUE);
                 EnableWindow(g_hBtnFwd, TRUE);
                 EnableWindow(g_hBtnBack, TRUE);
                 EnableWindow(g_hBtnMarkIn, TRUE);
                 EnableWindow(g_hBtnMarkOut, TRUE);
+<<<<<<< Updated upstream
                 EnableWindow(g_hBtnGotoMarkIn,  FALSE);
                 EnableWindow(g_hBtnGotoMarkOut, FALSE);
                 EnableWindow(g_hBtnZoom,        TRUE);
@@ -1436,6 +1639,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_thumbW = 0; g_thumbH = 0;
                 g_thumbThreadStop = false;
                 g_thumbThread = (HANDLE)_beginthreadex(nullptr, 0, ThumbExtractThreadProc, nullptr, 0, nullptr);
+=======
+                SetWindowTextW(g_hBtnPlayPause, L"Play");
+>>>>>>> Stashed changes
 
                 if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
                 g_hFrameBitmap = ExtractMiddleFrameBitmap(g_inputPath, g_vidWidth, g_vidHeight, g_duration);
@@ -1521,14 +1727,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+<<<<<<< Updated upstream
     case WM_APP_THUMBS_READY: {
         InvalidateRect(g_hTimeline, nullptr, FALSE);
+=======
+    case WM_HSCROLL: {
+        if ((HWND)lParam == g_hSeekbar && g_playerReady) {
+            if (LOWORD(wParam) == TB_THUMBTRACK || LOWORD(wParam) == TB_ENDTRACK ||
+                LOWORD(wParam) == SB_LINELEFT || LOWORD(wParam) == SB_LINERIGHT ||
+                LOWORD(wParam) == SB_PAGELEFT || LOWORD(wParam) == SB_PAGERIGHT) {
+                int pos = (int)SendMessage(g_hSeekbar, TBM_GETPOS, 0, 0);
+                bool wantSingle = !g_isPlaying;
+                EnsureThreadRunningPaused(hwnd);
+                SeekMs(pos, wantSingle);
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
+        }
+>>>>>>> Stashed changes
         break;
     }
 
     case WM_COMMAND: {
         int id = LOWORD(wParam);
 
+<<<<<<< Updated upstream
         if (id == IDC_RES_DROPDOWN) {
             // Show resolution popup menu below the button
             HMENU hMenu = CreatePopupMenu();
@@ -1560,6 +1782,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
         else if (id == IDC_RANGE_FULL_RADIO) {
+=======
+        if (id == IDC_RANGE_FULL_RADIO) {
+>>>>>>> Stashed changes
             SendMessage(g_hRangeFullRadio, BM_SETCHECK, BST_CHECKED, 0);
             SendMessage(g_hRangeCustomRadio, BM_SETCHECK, BST_UNCHECKED, 0);
             EnableWindow(g_hStartStatic, FALSE);
@@ -1658,6 +1883,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 char drive[_MAX_DRIVE], dir[_MAX_DIR], fname[_MAX_FNAME], ext[_MAX_EXT];
                 _splitpath_s(g_inputPath, drive, _MAX_DRIVE, dir, _MAX_DIR, fname, _MAX_FNAME, ext, _MAX_EXT);
+<<<<<<< Updated upstream
 
                 // Determine output directory
                 char outDir[MAX_PATH] = {};
@@ -1676,12 +1902,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     for (int i = 1;; i++) {
                         StringCchPrintfA(candidate, MAX_PATH, "%s%s_%s-%d.mp4",
                                          outDir, fname, suffixA, i);
+=======
+                char baseName[MAX_PATH];
+                StringCchPrintfA(baseName, MAX_PATH, "%s_%s%s", fname, suffixA, ext);
+                char candidate[MAX_PATH];
+                _makepath_s(candidate, MAX_PATH, drive, dir, baseName, nullptr);
+                if (_access(candidate, 0) == 0) {
+                    for (int i = 1;; i++) {
+                        char numbered[MAX_PATH];
+                        StringCchPrintfA(numbered, MAX_PATH, "%s_%s-%d%s", fname, suffixA, i, ext);
+                        _makepath_s(candidate, MAX_PATH, drive, dir, numbered, nullptr);
+>>>>>>> Stashed changes
                         if (_access(candidate, 0) != 0) break;
                     }
                 }
                 StringCchCopyA(outPath, MAX_PATH, candidate);
             }
 
+<<<<<<< Updated upstream
             // Read user-selected audio and subtitle stream indices
             int  selAudio = -1, selSubs = -1;
             char selExtSubPath[MAX_PATH] = {};
@@ -1734,6 +1972,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             if (g_encodeThread) { CloseHandle(g_encodeThread); g_encodeThread = nullptr; }
             g_encodeThread = (HANDLE)_beginthreadex(nullptr, 0, EncodeThreadProc, args, 0, nullptr);
+=======
+            EnableWindow(g_hStartButton, FALSE);
+            bool ok = TranscodeWithSizeAndScale(g_inputPath, outPath, targetSizeMB, scaleFactor,
+                g_vidWidth, g_vidHeight, startSecs, endSecs);
+            if (ok) {
+                std::string msg = "Successfully created:\n"; msg += outPath;
+                MessageBoxA(hwnd, msg.c_str(), "Success", MB_ICONINFORMATION);
+            }
+            else {
+                MessageBox(hwnd, L"Transcoding failed. See debug output for details.", L"Error", MB_ICONERROR);
+            }
+            EnableWindow(g_hStartButton, TRUE);
+>>>>>>> Stashed changes
         }
 
         if (id == IDC_BTN_PLAYPAUSE && g_playerReady) {
@@ -1751,6 +2002,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == IDC_BTN_MARKOUT && g_playerReady) {
             SetMarkOutFromCurrent(hwnd);
         }
+<<<<<<< Updated upstream
         else if (id == IDC_BTN_GOTO_MARKIN && g_playerReady && g_markInMs >= 0) {
             g_tlPos = (int)g_markInMs;
             InvalidateRect(g_hTimeline, nullptr, FALSE);
@@ -1793,10 +2045,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(g_hBtnZoom, nullptr, TRUE);
             InvalidateRect(g_hTimeline, nullptr, TRUE);
         }
+=======
+>>>>>>> Stashed changes
         break;
     }
 
     case WM_APP_FRAME_READY: {
+<<<<<<< Updated upstream
         g_isGenerating = false;
         if (g_videoTop > 0) {
             RECT rc; GetClientRect(hwnd, &rc);
@@ -1805,12 +2060,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
+=======
+        InvalidateRect(hwnd, nullptr, FALSE);
+>>>>>>> Stashed changes
         break;
     }
 
     case WM_TIMER: {
         if (wParam == IDT_UI_REFRESH) {
             UpdateSeekbarFromPos();
+<<<<<<< Updated upstream
             if (g_isPlaying && g_videoTop > 0) {
                 RECT rc; GetClientRect(hwnd, &rc);
                 rc.top = g_videoTop;
@@ -1842,6 +2101,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_encodeRunning  = false;
         EnableWindow(g_hStartButton, TRUE);
         InvalidateRect(g_hStartButton, nullptr, TRUE);
+=======
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+>>>>>>> Stashed changes
         break;
     }
 
@@ -1849,6 +2112,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
+<<<<<<< Updated upstream
         if (g_hFrameBitmap || g_isGenerating) {
             RECT clientRect; GetClientRect(hwnd, &clientRect);
 
@@ -1858,10 +2122,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ScreenToClient(hwnd, (POINT*)&sbRect.right);
             int margin = 10;
             int topY = sbRect.bottom + margin;
+=======
+        if (g_hFrameBitmap) {
+            RECT clientRect; GetClientRect(hwnd, &clientRect);
+
+            RECT sbRect;
+            GetWindowRect(g_hSeekbar, &sbRect);
+            ScreenToClient(hwnd, (POINT*)&sbRect.left);
+            ScreenToClient(hwnd, (POINT*)&sbRect.right);
+            int margin = 10;
+            int topY = sbRect.bottom + 30;
+>>>>>>> Stashed changes
 
             int availW = clientRect.right - margin * 2;
             int availH = clientRect.bottom - topY - margin;
             if (availW > 0 && availH > 0) {
+<<<<<<< Updated upstream
                 if (g_isGenerating) {
                     RECT msgRect = { margin, topY, clientRect.right - margin, clientRect.bottom - margin };
                     HFONT oldFont = g_hFont ? (HFONT)SelectObject(hdc, g_hFont) : nullptr;
@@ -1887,6 +2163,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SelectObject(memDC, oldBmp);
                     DeleteDC(memDC);
                 }
+=======
+                double imgAR = (double)g_frameWidth / (double)g_frameHeight;
+                int destW = availW;
+                int destH = (int)(availW / imgAR);
+                if (destH > availH) { destH = availH; destW = (int)(availH * imgAR); }
+                int destX = (clientRect.right - destW) / 2;
+                int destY = topY;
+
+                HDC memDC = CreateCompatibleDC(hdc);
+                HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, g_hFrameBitmap);
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, nullptr);
+                StretchBlt(hdc, destX, destY, destW, destH, memDC, 0, 0, g_frameWidth, g_frameHeight, SRCCOPY);
+                SelectObject(memDC, oldBmp);
+                DeleteDC(memDC);
+>>>>>>> Stashed changes
             }
         }
 
@@ -1894,6 +2186,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+<<<<<<< Updated upstream
     case WM_SYSCOMMAND:
         if (wParam == IDM_ABOUT) {
             MessageBoxW(hwnd,
@@ -1933,6 +2226,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hEditBrush)   { DeleteObject(g_hEditBrush);  g_hEditBrush   = nullptr; }
         if (g_hwDeviceCtx)  { av_buffer_unref(&g_hwDeviceCtx); g_hwDeviceCtx = nullptr; }
         if (g_encodeThread) { CloseHandle(g_encodeThread); g_encodeThread = nullptr; }
+=======
+    case WM_DESTROY:
+        StopPlayback();
+        if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
+>>>>>>> Stashed changes
         PostQuitMessage(0);
         break;
 
@@ -1942,6 +2240,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
+<<<<<<< Updated upstream
 // ------------------------------ External Subtitle Detection ------------------------------
 // Scans for .srt/.ass/.ssa/.sub/.vtt files next to the video with the same base name.
 static void ScanExternalSubtitles(const char* videoPath) {
@@ -2168,6 +2467,18 @@ bool GetVideoInfo(const char* filepath, int& width, int& height, double& duratio
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
         if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { videoStreamIndex = i; break; }
     }
+=======
+// ------------------------------ Video Info ------------------------------
+bool GetVideoInfo(const char* filepath, int& width, int& height, double& durationSeconds) {
+    AVFormatContext* fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) return false;
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) { avformat_close_input(&fmt_ctx); return false; }
+
+    int videoStreamIndex = -1;
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { videoStreamIndex = i; break; }
+    }
+>>>>>>> Stashed changes
     if (videoStreamIndex < 0) { avformat_close_input(&fmt_ctx); return false; }
 
     AVStream* videoStream = fmt_ctx->streams[videoStreamIndex];
@@ -2184,10 +2495,17 @@ bool GetVideoInfo(const char* filepath, int& width, int& height, double& duratio
     }
     else g_videoFPS = 30.0;
 
+<<<<<<< Updated upstream
+=======
+    AVFieldOrder fo = videoStream->codecpar->field_order;
+    g_isInterlaced = (fo == AV_FIELD_TT || fo == AV_FIELD_BB || fo == AV_FIELD_TB || fo == AV_FIELD_BT);
+
+>>>>>>> Stashed changes
     avformat_close_input(&fmt_ctx);
     return true;
 }
 
+<<<<<<< Updated upstream
 // ------------------------------ HDR Helpers (shared by preview, playback & encode) ------
 // Guard for older FFmpeg builds that don't define SWS_CS_BT2020
 #ifndef SWS_CS_BT2020
@@ -2319,6 +2637,28 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     HDC hdc = nullptr;
     void* dibBits = nullptr;
 
+=======
+// ------------------------------ Extract Middle Frame ------------------------------
+HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, double duration) {
+    AVFormatContext* fmt_ctx = nullptr;
+    AVCodecContext* dec_ctx = nullptr;
+    SwsContext* sws_ctx = nullptr;
+    AVPacket* pkt = nullptr;
+    AVFrame* frame = nullptr;
+    AVFrame* rgbFrame = nullptr;
+    int64_t middle_ts = 0;
+    uint8_t* rgbBuffer = nullptr;
+    HBITMAP hBitmap = nullptr;
+    int videoStreamIndex = -1;
+    AVStream* videoStream = nullptr;
+    const AVCodec* decoder = nullptr;
+    bool gotFrame = false;
+    int rgbBufSize = 0;
+    BITMAPINFO bmi = {};
+    HDC hdc = nullptr;
+    void* dibBits = nullptr;
+
+>>>>>>> Stashed changes
     if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) goto cleanup;
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) goto cleanup;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
@@ -2327,15 +2667,22 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     if (videoStreamIndex < 0) goto cleanup;
     videoStream = fmt_ctx->streams[videoStreamIndex];
 
+<<<<<<< Updated upstream
     decoder = find_best_decoder(videoStream->codecpar->codec_id, using_hw);
+=======
+    decoder = avcodec_find_decoder(videoStream->codecpar->codec_id);
+>>>>>>> Stashed changes
     if (!decoder) goto cleanup;
     dec_ctx = avcodec_alloc_context3(decoder);
     if (!dec_ctx) goto cleanup;
     if (avcodec_parameters_to_context(dec_ctx, videoStream->codecpar) < 0) goto cleanup;
+<<<<<<< Updated upstream
     if (using_hw) {
         dec_ctx->hw_device_ctx = av_buffer_ref(g_hwDeviceCtx);
         dec_ctx->get_format    = get_hw_format;
     }
+=======
+>>>>>>> Stashed changes
     if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) goto cleanup;
 
     middle_ts = (int64_t)((duration / 2.0) * AV_TIME_BASE);
@@ -2348,8 +2695,15 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
     pkt = av_packet_alloc();
     if (!pkt) goto cleanup;
 
+<<<<<<< Updated upstream
     // sws_ctx and rgbBuffer are created lazily on the first decoded frame because
     // with NVDEC the pixel format is not known until av_hwframe_transfer_data runs.
+=======
+    sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_ctx) goto cleanup;
+>>>>>>> Stashed changes
     rgbBufSize = av_image_get_buffer_size(AV_PIX_FMT_BGR24, dec_ctx->width, dec_ctx->height, 1);
     rgbBuffer = (uint8_t*)av_malloc(rgbBufSize);
     if (!rgbBuffer) goto cleanup;
@@ -2360,6 +2714,7 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
         if (pkt->stream_index == videoStreamIndex) {
             if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
             if (avcodec_receive_frame(dec_ctx, frame) == 0) {
+<<<<<<< Updated upstream
                 // Transfer NVDEC hardware frame to CPU memory if needed.
                 AVFrame* sw_frame = frame;
                 if (using_hw && frame->format == AV_PIX_FMT_CUDA) {
@@ -2435,6 +2790,11 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
                         gotFrame = true;
                     }
                 }
+=======
+                sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
+                    rgbFrame->data, rgbFrame->linesize);
+                gotFrame = true;
+>>>>>>> Stashed changes
                 av_frame_unref(frame);
                 av_packet_unref(pkt);
                 break;
@@ -2466,7 +2826,10 @@ HBITMAP ExtractMiddleFrameBitmap(const char* filepath, int orig_w, int orig_h, d
 
 cleanup:
     if (sws_ctx) sws_freeContext(sws_ctx);
+<<<<<<< Updated upstream
     if (cpu_frame) av_frame_free(&cpu_frame);
+=======
+>>>>>>> Stashed changes
     if (frame) av_frame_free(&frame);
     if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
     if (pkt) av_packet_free(&pkt);
@@ -2483,6 +2846,374 @@ unsigned __stdcall PlaybackThreadProc(void* p) {
     const char* filepath = ctx->path.c_str();
 
     AVFormatContext* fmt_ctx = nullptr;
+<<<<<<< Updated upstream
+=======
+    AVCodecContext* dec_ctx = nullptr;
+    SwsContext* sws_ctx = nullptr;
+    AVPacket* pkt = nullptr;
+    AVFrame* frame = nullptr;
+    AVFrame* rgbFrame = nullptr;
+    int              videoStreamIndex = -1;
+    AVStream* videoStream = nullptr;
+    const AVCodec* decoder = nullptr;
+    uint8_t* rgbBuffer = nullptr;
+    int              rgbBufSize = 0;
+
+    bool init_ok = false;
+    do {
+        if (avformat_open_input(&fmt_ctx, filepath, nullptr, nullptr) < 0) break;
+        if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) break;
+        for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+            if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { videoStreamIndex = i; break; }
+        }
+        if (videoStreamIndex < 0) break;
+        videoStream = fmt_ctx->streams[videoStreamIndex];
+
+        decoder = avcodec_find_decoder(videoStream->codecpar->codec_id);
+        if (!decoder) break;
+        dec_ctx = avcodec_alloc_context3(decoder);
+        if (!dec_ctx) break;
+        if (avcodec_parameters_to_context(dec_ctx, videoStream->codecpar) < 0) break;
+        if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) break;
+
+        sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+            dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_ctx) break;
+
+        frame = av_frame_alloc();
+        rgbFrame = av_frame_alloc();
+        if (!frame || !rgbFrame) break;
+
+        rgbBufSize = av_image_get_buffer_size(AV_PIX_FMT_BGR24, dec_ctx->width, dec_ctx->height, 1);
+        rgbBuffer = (uint8_t*)av_malloc(rgbBufSize);
+        if (!rgbBuffer) break;
+        av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, rgbBuffer,
+            AV_PIX_FMT_BGR24, dec_ctx->width, dec_ctx->height, 1);
+
+        pkt = av_packet_alloc();
+        if (!pkt) break;
+
+        init_ok = true;
+    } while (false);
+
+    if (!init_ok) {
+        // cleanup and exit
+        if (pkt) av_packet_free(&pkt);
+        if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
+        if (frame) av_frame_free(&frame);
+        if (sws_ctx) sws_freeContext(sws_ctx);
+        if (dec_ctx) avcodec_free_context(&dec_ctx);
+        if (fmt_ctx) avformat_close_input(&fmt_ctx);
+        delete ctx;
+        _endthreadex(0);
+        return 0;
+    }
+
+    auto doSeek = [&](int64_t toMs) {
+        int64_t ts = av_rescale_q(toMs, AVRational{ 1,1000 }, videoStream->time_base);
+        av_seek_frame(fmt_ctx, videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(dec_ctx);
+        };
+
+    if (g_seekRequested) { doSeek(g_seekTargetMs); g_seekRequested = false; }
+    else { doSeek(g_currentPosMs); }
+
+    while (!g_playThreadShouldExit) {
+        if (g_seekRequested) {
+            int64_t target = g_seekTargetMs;
+            g_seekRequested = false;
+            doSeek(target);
+        }
+
+        // Paused single-frame preview with proper step logic
+        if (g_decodeSingleFrame && !g_isPlaying) {
+            bool produced = false;
+            int64_t targetMs = g_seekTargetMs;
+            int64_t bestMs = -1;
+            HBITMAP bestBmp = nullptr;
+
+            while (av_read_frame(fmt_ctx, pkt) >= 0) {
+                if (pkt->stream_index != videoStreamIndex) { av_packet_unref(pkt); continue; }
+                if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
+
+                while (avcodec_receive_frame(dec_ctx, frame) == 0) {
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
+                        rgbFrame->data, rgbFrame->linesize);
+
+                    // Create DIB
+                    BITMAPINFO bmi = {};
+                    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                    bmi.bmiHeader.biWidth = dec_ctx->width;
+                    bmi.bmiHeader.biHeight = -dec_ctx->height;
+                    bmi.bmiHeader.biPlanes = 1;
+                    bmi.bmiHeader.biBitCount = 24;
+                    bmi.bmiHeader.biCompression = BI_RGB;
+
+                    HDC hdc = GetDC(nullptr);
+                    void* dibBits = nullptr;
+                    HBITMAP hNew = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+                    ReleaseDC(nullptr, hdc);
+
+                    if (hNew) {
+                        int rowBytes = dec_ctx->width * 3;
+                        for (int y = 0; y < dec_ctx->height; y++) {
+                            memcpy((uint8_t*)dibBits + y * rowBytes,
+                                rgbFrame->data[0] + y * rgbFrame->linesize[0], rowBytes);
+                        }
+                    }
+
+                    int64_t ms = (int64_t)(frame->best_effort_timestamp *
+                        av_q2d(videoStream->time_base) * 1000.0);
+
+                    if (g_stepDir >= 0) {
+                        // Forward step: stop at first frame >= target
+                        if (ms >= targetMs) {
+                            EnterCriticalSection(&g_csState);
+                            if (g_hFrameBitmap) DeleteObject(g_hFrameBitmap);
+                            g_hFrameBitmap = hNew; hNew = nullptr;
+                            g_frameWidth = dec_ctx->width;
+                            g_frameHeight = dec_ctx->height;
+                            g_currentPosMs = ms;
+                            LeaveCriticalSection(&g_csState);
+                            produced = true;
+                        }
+                    }
+                    else {
+                        // Backward step: remember last frame strictly before target
+                        if (ms < targetMs) {
+                            if (bestBmp) DeleteObject(bestBmp);
+                            bestBmp = hNew; hNew = nullptr;
+                            bestMs = ms;
+                        }
+                        else {
+                            // Crossed target, present best previous if exists
+                            if (bestBmp) {
+                                EnterCriticalSection(&g_csState);
+                                if (g_hFrameBitmap) DeleteObject(g_hFrameBitmap);
+                                g_hFrameBitmap = bestBmp; bestBmp = nullptr;
+                                g_frameWidth = dec_ctx->width;
+                                g_frameHeight = dec_ctx->height;
+                                g_currentPosMs = (bestMs >= 0) ? bestMs : ms;
+                                LeaveCriticalSection(&g_csState);
+                                produced = true;
+                            }
+                            else {
+                                EnterCriticalSection(&g_csState);
+                                if (g_hFrameBitmap) DeleteObject(g_hFrameBitmap);
+                                g_hFrameBitmap = hNew; hNew = nullptr;
+                                g_frameWidth = dec_ctx->width;
+                                g_frameHeight = dec_ctx->height;
+                                g_currentPosMs = ms;
+                                LeaveCriticalSection(&g_csState);
+                                produced = true;
+                            }
+                        }
+                    }
+
+                    if (hNew) DeleteObject(hNew);
+                    av_frame_unref(frame);
+                    if (produced) break;
+                }
+                av_packet_unref(pkt);
+                if (produced) break;
+            }
+
+            g_decodeSingleFrame = false;
+            g_stepDir = 0;
+            if (produced) {
+                PostMessage(g_mainHwnd, WM_APP_FRAME_READY, 0, 0);
+            }
+            Sleep(5);
+            continue;
+        }
+
+        if (!g_isPlaying) { Sleep(10); continue; }
+
+        if (av_read_frame(fmt_ctx, pkt) < 0) {
+            g_isPlaying = false;
+            continue;
+        }
+        if (pkt->stream_index != videoStreamIndex) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (avcodec_send_packet(dec_ctx, pkt) < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        while (avcodec_receive_frame(dec_ctx, frame) == 0) {
+            sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height,
+                rgbFrame->data, rgbFrame->linesize);
+
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = dec_ctx->width;
+            bmi.bmiHeader.biHeight = -dec_ctx->height;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 24;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            HDC hdc = GetDC(nullptr);
+            void* dibBits = nullptr;
+            HBITMAP hNew = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+            ReleaseDC(nullptr, hdc);
+            if (hNew) {
+                int rowBytes = dec_ctx->width * 3;
+                for (int y = 0; y < dec_ctx->height; y++) {
+                    memcpy((uint8_t*)dibBits + y * rowBytes,
+                        rgbFrame->data[0] + y * rgbFrame->linesize[0], rowBytes);
+                }
+                EnterCriticalSection(&g_csState);
+                if (g_hFrameBitmap) DeleteObject(g_hFrameBitmap);
+                g_hFrameBitmap = hNew;
+                g_frameWidth = dec_ctx->width;
+                g_frameHeight = dec_ctx->height;
+                int64_t ms = (int64_t)(frame->best_effort_timestamp *
+                    av_q2d(videoStream->time_base) * 1000.0);
+                g_currentPosMs = ms;
+                LeaveCriticalSection(&g_csState);
+            }
+            PostMessage(g_mainHwnd, WM_APP_FRAME_READY, 0, 0);
+            av_frame_unref(frame);
+        }
+        av_packet_unref(pkt);
+
+        Sleep((DWORD)max(1.0, 1000.0 / g_videoFPS));
+    }
+
+    // cleanup
+    if (pkt) av_packet_free(&pkt);
+    if (rgbFrame) { if (rgbBuffer) av_free(rgbBuffer); av_frame_free(&rgbFrame); }
+    if (frame) av_frame_free(&frame);
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    if (dec_ctx) avcodec_free_context(&dec_ctx);
+    if (fmt_ctx) avformat_close_input(&fmt_ctx);
+
+    delete ctx;
+    _endthreadex(0);
+    return 0;
+}
+
+void StartPlayback(HWND hwnd) {
+    EnterCriticalSection(&g_csState);
+    if (g_hFrameBitmap) { DeleteObject(g_hFrameBitmap); g_hFrameBitmap = nullptr; }
+    LeaveCriticalSection(&g_csState);
+
+    if (g_hPlaybackThread) return;
+    g_playThreadShouldExit = false;
+    g_isPlaying = true;
+
+    PlaybackCtx* ctx = new PlaybackCtx();
+    ctx->path = g_inputPath;
+    uintptr_t th = _beginthreadex(nullptr, 0, PlaybackThreadProc, ctx, 0, nullptr);
+    g_hPlaybackThread = (HANDLE)th;
+
+    SetTimer(hwnd, IDT_UI_REFRESH, 33, nullptr);
+}
+
+void EnsureThreadRunningPaused(HWND hwnd) {
+    if (!g_hPlaybackThread) {
+        g_playThreadShouldExit = false;
+        g_isPlaying = false;
+        PlaybackCtx* ctx = new PlaybackCtx();
+        ctx->path = g_inputPath;
+        uintptr_t th = _beginthreadex(nullptr, 0, PlaybackThreadProc, ctx, 0, nullptr);
+        g_hPlaybackThread = (HANDLE)th;
+        SetTimer(hwnd, IDT_UI_REFRESH, 33, nullptr);
+    }
+}
+
+void StopPlayback() {
+    g_isPlaying = false;
+    g_playThreadShouldExit = true;
+    if (g_hPlaybackThread) {
+        WaitForSingleObject(g_hPlaybackThread, 5000);
+        CloseHandle(g_hPlaybackThread);
+        g_hPlaybackThread = nullptr;
+    }
+}
+
+void TogglePlayPause(HWND hwnd) {
+    if (!g_hPlaybackThread) {
+        StartPlayback(hwnd);
+        SetWindowTextW(g_hBtnPlayPause, L"Pause");
+        return;
+    }
+    g_isPlaying = !g_isPlaying;
+    SetWindowTextW(g_hBtnPlayPause, g_isPlaying ? L"Pause" : L"Play");
+}
+
+void SeekMs(int64_t ms, bool decodeSingle) {
+    if (ms < 0) ms = 0;
+    int64_t durMs = (int64_t)(g_duration * 1000.0);
+    if (ms > durMs) ms = durMs;
+
+    g_seekTargetMs = ms;
+    g_seekRequested = true;
+    if (decodeSingle) g_decodeSingleFrame = true;
+}
+
+
+void StepForward(HWND hwnd) {
+    EnsureThreadRunningPaused(hwnd);
+    g_isPlaying = false;
+    int frameMs = (int)max(1.0, 1000.0 / g_videoFPS);
+    g_stepDir = +1;
+    SeekMs(g_currentPosMs + frameMs, true);
+}
+
+
+void StepBackward(HWND hwnd) {
+    EnsureThreadRunningPaused(hwnd);
+    g_isPlaying = false;
+    int frameMs = (int)max(1.0, 1000.0 / g_videoFPS);
+    g_stepDir = -1;
+    // Seek slightly earlier than one frame to ensure we land before target and then walk forward
+    int64_t target = (g_currentPosMs > frameMs * 2) ? (g_currentPosMs - frameMs * 2) : 0;
+    SeekMs(target, true);
+}
+
+
+void UpdateSeekbarFromPos() {
+    if (!g_playerReady) return;
+    int pos = (int)g_currentPosMs;
+    SendMessage(g_hSeekbar, TBM_SETPOS, TRUE, pos);
+}
+
+void SetMarkInFromCurrent(HWND hwnd) {
+    SendMessage(g_hRangeFullRadio, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessage(g_hRangeCustomRadio, BM_SETCHECK, BST_CHECKED, 0);
+    EnableWindow(g_hStartStatic, TRUE);
+    EnableWindow(g_hStartEdit, TRUE);
+    EnableWindow(g_hEndStatic, TRUE);
+    EnableWindow(g_hEndEdit, TRUE);
+
+    double secs = g_currentPosMs / 1000.0;
+    wchar_t buf[32]; StringCchPrintfW(buf, 32, L"%.3f", secs);
+    SetWindowTextW(g_hStartEdit, buf);
+}
+
+void SetMarkOutFromCurrent(HWND hwnd) {
+    SendMessage(g_hRangeFullRadio, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessage(g_hRangeCustomRadio, BM_SETCHECK, BST_CHECKED, 0);
+    EnableWindow(g_hStartStatic, TRUE);
+    EnableWindow(g_hStartEdit, TRUE);
+    EnableWindow(g_hEndStatic, TRUE);
+    EnableWindow(g_hEndEdit, TRUE);
+
+    double secs = g_currentPosMs / 1000.0;
+    wchar_t buf[32]; StringCchPrintfW(buf, 32, L"%.3f", secs);
+    SetWindowTextW(g_hEndEdit, buf);
+}
+
+// ------------------------------ Transcode (unchanged) ------------------------------
+bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename, double target_size_mb,
+    int scale_factor, int orig_w, int orig_h, double start_seconds, double end_seconds) {
+    int64_t           target_bitrate;
+    AVFormatContext* in_fmt_ctx = nullptr;
+    AVFormatContext* out_fmt_ctx = nullptr;
+>>>>>>> Stashed changes
     AVCodecContext* dec_ctx = nullptr;
     SwsContext* sws_ctx = nullptr;
     AVPacket* pkt = nullptr;
@@ -3185,6 +3916,7 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     std::vector<TextSubEvent> text_sub_events;
     int               videoStreamIndex = -1;
     int               audioStreamIndex = -1;
+<<<<<<< Updated upstream
     AVFrame*          frame            = nullptr;
     AVFrame*          filt_frame       = nullptr;
     AVFrame*          cpu_frame        = nullptr;   // for NVDEC hw→cpu transfer
@@ -3206,15 +3938,38 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     AVFrame*          aEncFrame        = nullptr;
     AVPacket*         aEncPkt          = nullptr;
     int64_t           aOutPts          = 0;
+=======
+    AVFrame* frame = nullptr;
+    AVFrame* filt_frame = nullptr;
+    AVPacket* pkt = nullptr;
+    AVPacket* enc_pkt = nullptr;
+    bool              success = false;
+    int64_t           video_start_pts = 0;
+    int64_t           audio_start_pts = 0;
+    AVFilterGraph*    yadif_graph = nullptr;
+    AVFilterContext*  yadif_src_ctx = nullptr;
+    AVFilterContext*  yadif_sink_ctx = nullptr;
+    AVFrame*          yadif_frame = nullptr;
+>>>>>>> Stashed changes
 
     if (end_seconds <= start_seconds) { OutputDebugStringA("End time must be greater than start time.\n"); return false; }
     double segment_duration = end_seconds - start_seconds;
     if (segment_duration <= 0.0) { OutputDebugStringA("Invalid segment duration.\n"); return false; }
+<<<<<<< Updated upstream
+=======
+    {
+        int64_t total_bits = (int64_t)(target_size_mb * 8.0 * 1024.0 * 1024.0);
+        int64_t video_bits = (int64_t)(total_bits * 0.95);
+        target_bitrate = video_bits / (int64_t)segment_duration;
+    }
+    if (target_bitrate <= 0) { OutputDebugStringA("Invalid target bitrate calculated.\n"); return false; }
+>>>>>>> Stashed changes
 
     if (avformat_open_input(&in_fmt_ctx, in_filename, nullptr, nullptr) < 0) { OutputDebugStringA("Could not open input file.\n"); goto cleanup; }
     if (avformat_find_stream_info(in_fmt_ctx, nullptr) < 0) { OutputDebugStringA("Could not find stream info.\n"); goto cleanup; }
     for (unsigned int i = 0; i < in_fmt_ctx->nb_streams; i++) {
         AVStream* st = in_fmt_ctx->streams[i];
+<<<<<<< Updated upstream
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex < 0) { videoStreamIndex = (int)i; }
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex < 0) { audioStreamIndex = (int)i; }
     }
@@ -3223,10 +3978,16 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         in_fmt_ctx->streams[audio_stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
         audioStreamIndex = audio_stream_index;
 
+=======
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex < 0) { videoStreamIndex = i; }
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex < 0) { audioStreamIndex = i; }
+    }
+>>>>>>> Stashed changes
     if (videoStreamIndex < 0) { OutputDebugStringA("No video stream found.\n"); goto cleanup; }
     video_in_stream = in_fmt_ctx->streams[videoStreamIndex];
     if (audioStreamIndex >= 0) audio_in_stream = in_fmt_ctx->streams[audioStreamIndex];
 
+<<<<<<< Updated upstream
     // Stream start_time offsets: AVI/Xvid (and some other containers) can have a
     // non-zero start_time so that the first frame's PTS is not 0.  All timestamp
     // arithmetic must subtract this offset to get elapsed-seconds-from-file-start.
@@ -3251,10 +4012,14 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     if (target_bitrate <= 0) { OutputDebugStringA("Invalid target bitrate calculated.\n"); goto cleanup; }
 
     video_decoder = find_best_decoder(video_in_stream->codecpar->codec_id, using_hw);
+=======
+    video_decoder = avcodec_find_decoder(video_in_stream->codecpar->codec_id);
+>>>>>>> Stashed changes
     if (!video_decoder) { OutputDebugStringA("Video decoder not found.\n"); goto cleanup; }
     dec_ctx = avcodec_alloc_context3(video_decoder);
     if (!dec_ctx) { OutputDebugStringA("Failed to allocate video decoder context.\n"); goto cleanup; }
     if (avcodec_parameters_to_context(dec_ctx, video_in_stream->codecpar) < 0) { OutputDebugStringA("Failed to copy video params to decoder.\n"); goto cleanup; }
+<<<<<<< Updated upstream
     if (using_hw) {
         dec_ctx->hw_device_ctx = av_buffer_ref(g_hwDeviceCtx);
         dec_ctx->get_format    = get_hw_format;
@@ -3274,6 +4039,10 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     }
     trans_bsf_pkt = trans_bsf_ctx ? av_packet_alloc() : nullptr;
 
+=======
+    if (avcodec_open2(dec_ctx, video_decoder, nullptr) < 0) { OutputDebugStringA("Failed to open video decoder.\n"); goto cleanup; }
+
+>>>>>>> Stashed changes
     avformat_alloc_output_context2(&out_fmt_ctx, nullptr, nullptr, out_filename);
     if (!out_fmt_ctx) { OutputDebugStringA("Could not create output format context.\n"); goto cleanup; }
 
@@ -3287,6 +4056,7 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     enc_ctx->height = orig_h / scale_factor;
     enc_ctx->width = orig_w / scale_factor;
     enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
+<<<<<<< Updated upstream
     // Use YUV420P for both h264_nvenc and libx264.  h264_nvenc accepts YUV420P
     // and converts to NV12 internally; this avoids semi-planar UV confusion when
     // the decoded frame (NV12 from NVDEC) is scaled or filtered.
@@ -3324,6 +4094,24 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
     enc_ctx->bit_rate       = target_bitrate;
     enc_ctx->rc_max_rate    = target_bitrate;
     enc_ctx->rc_buffer_size = target_bitrate * 2; // 2-second VBV window for smoother rate control
+=======
+    bool use_nvenc = (strcmp(video_encoder->name, "h264_nvenc") == 0);
+    if (use_nvenc) {
+        enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
+        av_opt_set(enc_ctx->priv_data, "preset", "p4", 0);
+        av_opt_set(enc_ctx->priv_data, "rc",     "cbr", 0);
+    }
+    else { enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P; av_opt_set(enc_ctx->priv_data, "preset", "medium", 0); av_opt_set(enc_ctx->priv_data, "nal-hrd", "cbr", 0); }
+    {
+        AVRational fr = dec_ctx->framerate;
+        if (fr.num == 0 || fr.den == 0) fr = video_in_stream->avg_frame_rate;
+        if (fr.num == 0 || fr.den == 0) fr = { 30000, 1001 };
+        enc_ctx->time_base = av_inv_q(fr);
+    }
+    enc_ctx->bit_rate = target_bitrate;
+    enc_ctx->rc_max_rate = target_bitrate;
+    enc_ctx->rc_buffer_size = target_bitrate;
+>>>>>>> Stashed changes
     if (out_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (avcodec_open2(enc_ctx, video_encoder, nullptr) < 0) { OutputDebugStringA("Could not open video encoder.\n"); goto cleanup; }
     if (avcodec_parameters_from_context(video_out_stream->codecpar, enc_ctx) < 0) { OutputDebugStringA("Failed to copy encoder params to output.\n"); goto cleanup; }
@@ -3331,6 +4119,7 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
 
     if (audio_in_stream) {
         audio_out_stream = avformat_new_stream(out_fmt_ctx, nullptr);
+<<<<<<< Updated upstream
         bool audioOk = false;
         if (audio_out_stream) {
             const AVCodec* aDec = avcodec_find_decoder(audio_in_stream->codecpar->codec_id);
@@ -3387,12 +4176,19 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
             if (aEncPkt)   { av_packet_free(&aEncPkt);         aEncPkt   = nullptr; }
             audio_in_stream  = nullptr;
             audio_out_stream = nullptr;
+=======
+        if (!audio_out_stream) { OutputDebugStringA("Could not create audio output stream. Disabling audio.\n"); audio_in_stream = nullptr; }
+        else {
+            if (avcodec_parameters_copy(audio_out_stream->codecpar, audio_in_stream->codecpar) < 0) { OutputDebugStringA("Failed to copy audio params. Disabling audio.\n"); audio_in_stream = nullptr; audio_out_stream = nullptr; }
+            else audio_out_stream->time_base = audio_in_stream->time_base;
+>>>>>>> Stashed changes
         }
     }
 
     if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&out_fmt_ctx->pb, out_filename, AVIO_FLAG_WRITE) < 0) { OutputDebugStringA("Could not open output file.\n"); goto cleanup; }
     }
+<<<<<<< Updated upstream
     {
         AVDictionary* mux_opts = nullptr;
         av_dict_set(&mux_opts, "movflags", "faststart", 0); // moov atom at front → instant seeking
@@ -3408,6 +4204,16 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         int64_t start_av = (int64_t)llround(start_seconds * AV_TIME_BASE);
         video_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, video_tb) + vid_stream_start;
 
+=======
+    if (avformat_write_header(out_fmt_ctx, nullptr) < 0) { OutputDebugStringA("Error writing header to output.\n"); goto cleanup; }
+
+    {
+        AVRational video_tb = video_in_stream->time_base;
+        // Convert start_seconds (in AV_TIME_BASE) to the video stream's time_base.
+        int64_t start_av = (int64_t)llround(start_seconds * AV_TIME_BASE);
+        video_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, video_tb);
+
+>>>>>>> Stashed changes
         // Seek the demuxer to (or just before) the requested start on the video stream.
         if (av_seek_frame(in_fmt_ctx, videoStreamIndex, video_start_pts, AVSEEK_FLAG_BACKWARD) < 0) {
             OutputDebugStringA("Warning: could not seek exactly to start time (video).\n");
@@ -3416,23 +4222,90 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
         // Prepare audio timeline anchor too (if present).
         if (audio_in_stream) {
             AVRational audio_tb = audio_in_stream->time_base;
+<<<<<<< Updated upstream
             audio_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, audio_tb) + aud_stream_start;
+=======
+            audio_start_pts = av_rescale_q(start_av, AV_TIME_BASE_Q, audio_tb);
+>>>>>>> Stashed changes
         }
     }
     avcodec_flush_buffers(dec_ctx);
 
+<<<<<<< Updated upstream
+=======
+    // Set up yadif de-interlace filter if the source is interlaced
+    if (g_isInterlaced) {
+        const AVFilter* buffersrc  = avfilter_get_by_name("buffer");
+        const AVFilter* buffersink = avfilter_get_by_name("buffersink");
+        AVFilterInOut*  filt_out   = avfilter_inout_alloc();
+        AVFilterInOut*  filt_in    = avfilter_inout_alloc();
+        yadif_graph = avfilter_graph_alloc();
+        int ret = -1;
+        if (buffersrc && buffersink && filt_out && filt_in && yadif_graph) {
+            char src_args[512];
+            AVRational sar = dec_ctx->sample_aspect_ratio;
+            if (sar.num == 0) { sar.num = 1; sar.den = 1; }
+            snprintf(src_args, sizeof(src_args),
+                "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                dec_ctx->width, dec_ctx->height, (int)dec_ctx->pix_fmt,
+                video_in_stream->time_base.num, video_in_stream->time_base.den,
+                sar.num, sar.den);
+            ret = avfilter_graph_create_filter(&yadif_src_ctx,  buffersrc,  "in",  src_args, nullptr, yadif_graph);
+            if (ret >= 0)
+                ret = avfilter_graph_create_filter(&yadif_sink_ctx, buffersink, "out", nullptr,   nullptr, yadif_graph);
+            if (ret >= 0) {
+                enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
+                ret = av_opt_set_int_list(yadif_sink_ctx, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+            }
+            if (ret >= 0) {
+                filt_out->name       = av_strdup("in");
+                filt_out->filter_ctx = yadif_src_ctx;
+                filt_out->pad_idx    = 0;
+                filt_out->next       = nullptr;
+                filt_in->name        = av_strdup("out");
+                filt_in->filter_ctx  = yadif_sink_ctx;
+                filt_in->pad_idx     = 0;
+                filt_in->next        = nullptr;
+                ret = avfilter_graph_parse_ptr(yadif_graph, "yadif=mode=0:parity=-1", &filt_in, &filt_out, nullptr);
+            }
+            if (ret >= 0) ret = avfilter_graph_config(yadif_graph, nullptr);
+        }
+        avfilter_inout_free(&filt_in);
+        avfilter_inout_free(&filt_out);
+        if (ret < 0) {
+            OutputDebugStringA("Warning: could not set up yadif filter; de-interlacing disabled.\n");
+            avfilter_graph_free(&yadif_graph);
+            yadif_graph    = nullptr;
+            yadif_src_ctx  = nullptr;
+            yadif_sink_ctx = nullptr;
+        }
+    }
+>>>>>>> Stashed changes
 
     frame = av_frame_alloc();
     filt_frame = av_frame_alloc();
+    yadif_frame = av_frame_alloc();
     pkt = av_packet_alloc();
     enc_pkt = av_packet_alloc();
+<<<<<<< Updated upstream
     if (!frame || !filt_frame || !pkt || !enc_pkt) { OutputDebugStringA("Could not allocate frame/packet.\n"); goto cleanup; }
     // sws_ctx is created lazily on the first decoded frame because with NVDEC the
     // pixel format (dec_ctx->pix_fmt) is AV_PIX_FMT_CUDA until hw→cpu transfer reveals it.
+=======
+    if (!frame || !filt_frame || !yadif_frame || !pkt || !enc_pkt) { OutputDebugStringA("Could not allocate frame/packet.\n"); goto cleanup; }
+    {
+        AVPixelFormat sws_src_fmt = (yadif_src_ctx != nullptr) ? AV_PIX_FMT_YUV420P : dec_ctx->pix_fmt;
+        sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, sws_src_fmt,
+            enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+    }
+    if (!sws_ctx) { OutputDebugStringA("Could not initialize SwsContext.\n"); goto cleanup; }
+>>>>>>> Stashed changes
     filt_frame->format = enc_ctx->pix_fmt;
     filt_frame->width = enc_ctx->width;
     filt_frame->height = enc_ctx->height;
     if (av_frame_get_buffer(filt_frame, 32) < 0) { OutputDebugStringA("Could not allocate buffer for scaled frame.\n"); goto cleanup; }
+<<<<<<< Updated upstream
 
     if (convert_hdr_to_sdr) {
         // Stage 1 (sws_hdr2rgb) is created lazily on first frame — input pixel format
@@ -4401,10 +5274,63 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, video_out_stream->time_base);
                     av_interleaved_write_frame(out_fmt_ctx, enc_pkt);
                     av_packet_unref(enc_pkt);
+=======
+
+    while (av_read_frame(in_fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index == videoStreamIndex) {
+            if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); break; }
+            while (avcodec_receive_frame(dec_ctx, frame) == 0) {
+                int64_t in_pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE) ? frame->best_effort_timestamp : frame->pts;
+                double in_time = in_pts * av_q2d(video_in_stream->time_base);
+                if (in_time > end_seconds) { av_frame_unref(frame); goto flush_encoder; }
+
+                // Drop frames that still decode before the requested start
+                if (in_time < start_seconds) { av_frame_unref(frame); continue; }
+
+                if (yadif_src_ctx) {
+                    // Route through yadif de-interlace filter
+                    if (av_buffersrc_add_frame_flags(yadif_src_ctx, frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+                        while (av_buffersink_get_frame(yadif_sink_ctx, yadif_frame) >= 0) {
+                            int64_t f_pts = (yadif_frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                ? yadif_frame->best_effort_timestamp : yadif_frame->pts;
+                            int64_t rel_pts = f_pts - video_start_pts;
+                            if (rel_pts < 0) rel_pts = 0;
+                            filt_frame->pts = av_rescale_q(rel_pts, video_in_stream->time_base, enc_ctx->time_base);
+                            sws_scale(sws_ctx, yadif_frame->data, yadif_frame->linesize, 0, yadif_frame->height,
+                                filt_frame->data, filt_frame->linesize);
+                            filt_frame->interlaced_frame = 0;
+                            filt_frame->top_field_first  = 0;
+                            if (avcodec_send_frame(enc_ctx, filt_frame) >= 0) {
+                                while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
+                                    enc_pkt->stream_index = video_out_stream->index;
+                                    av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, video_out_stream->time_base);
+                                    av_interleaved_write_frame(out_fmt_ctx, enc_pkt);
+                                    av_packet_unref(enc_pkt);
+                                }
+                            }
+                            av_frame_unref(yadif_frame);
+                        }
+                    }
+                }
+                else {
+                    // Progressive path: scale directly
+                    int64_t rel_vid_pts = in_pts - video_start_pts;
+                    if (rel_vid_pts < 0) rel_vid_pts = 0;
+                    filt_frame->pts = av_rescale_q(rel_vid_pts, video_in_stream->time_base, enc_ctx->time_base);
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, dec_ctx->height, filt_frame->data, filt_frame->linesize);
+                    if (avcodec_send_frame(enc_ctx, filt_frame) < 0) { OutputDebugStringA("Error sending frame to video encoder.\n"); }
+                    while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
+                        enc_pkt->stream_index = video_out_stream->index;
+                        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, video_out_stream->time_base);
+                        av_interleaved_write_frame(out_fmt_ctx, enc_pkt);
+                        av_packet_unref(enc_pkt);
+                    }
+>>>>>>> Stashed changes
                 }
                 av_frame_unref(frame);
             }
         }
+<<<<<<< Updated upstream
 
         else if (audio_in_stream && pkt->stream_index == audioStreamIndex
                  && aDec_ctx && aEnc_ctx && aSwrCtx) {
@@ -4437,12 +5363,62 @@ bool TranscodeWithSizeAndScale(const char* in_filename, const char* out_filename
                     }
                 }
             }
+=======
+
+        else if (audio_in_stream && pkt->stream_index == audioStreamIndex) {
+            AVRational in_tb = audio_in_stream->time_base;
+            AVRational out_tb = audio_out_stream->time_base;
+            // Normalize missing PTS/DTS
+            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE) pkt->pts = pkt->dts;
+            if (pkt->dts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) pkt->dts = pkt->pts;
+
+            int64_t aud_in_pts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+            double aud_time = aud_in_pts * av_q2d(in_tb);
+            if (aud_time < start_seconds || aud_time > end_seconds) { av_packet_unref(pkt); continue; }
+
+            // Shift audio PTS/DTS so segment starts at t=0 in the audio TB
+            if (pkt->pts != AV_NOPTS_VALUE) { pkt->pts -= audio_start_pts; if (pkt->pts < 0) pkt->pts = 0; }
+            if (pkt->dts != AV_NOPTS_VALUE) { pkt->dts -= audio_start_pts; if (pkt->dts < 0) pkt->dts = 0; }
+
+            // Rescale into output TB and write
+            av_packet_rescale_ts(pkt, in_tb, out_tb);
+            pkt->stream_index = audio_out_stream->index;
+            pkt->pos = -1;
+            av_interleaved_write_frame(out_fmt_ctx, pkt);
+>>>>>>> Stashed changes
         }
 
         av_packet_unref(pkt);
     }
 
 flush_encoder:
+<<<<<<< Updated upstream
+=======
+    // Flush yadif filter before flushing encoder
+    if (yadif_src_ctx) {
+        av_buffersrc_add_frame_flags(yadif_src_ctx, nullptr, 0);
+        while (av_buffersink_get_frame(yadif_sink_ctx, yadif_frame) >= 0) {
+            int64_t f_pts = (yadif_frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                ? yadif_frame->best_effort_timestamp : yadif_frame->pts;
+            int64_t rel_pts = f_pts - video_start_pts;
+            if (rel_pts < 0) rel_pts = 0;
+            filt_frame->pts = av_rescale_q(rel_pts, video_in_stream->time_base, enc_ctx->time_base);
+            sws_scale(sws_ctx, yadif_frame->data, yadif_frame->linesize, 0, yadif_frame->height,
+                filt_frame->data, filt_frame->linesize);
+            filt_frame->interlaced_frame = 0;
+            filt_frame->top_field_first  = 0;
+            if (avcodec_send_frame(enc_ctx, filt_frame) >= 0) {
+                while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
+                    enc_pkt->stream_index = video_out_stream->index;
+                    av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, video_out_stream->time_base);
+                    av_interleaved_write_frame(out_fmt_ctx, enc_pkt);
+                    av_packet_unref(enc_pkt);
+                }
+            }
+            av_frame_unref(yadif_frame);
+        }
+    }
+>>>>>>> Stashed changes
     avcodec_send_frame(enc_ctx, nullptr);
     while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
         enc_pkt->stream_index = video_out_stream->index;
@@ -4452,6 +5428,7 @@ flush_encoder:
     }
     av_packet_unref(enc_pkt);
 
+<<<<<<< Updated upstream
     // Flush audio: drain swr remainder (partial frame), then flush encoder
     if (aEnc_ctx && aSwrCtx && audio_out_stream && aEncFrame && aEncPkt) {
         int remaining = swr_get_out_samples(aSwrCtx, 0);
@@ -4478,12 +5455,15 @@ flush_encoder:
         }
     }
 
+=======
+>>>>>>> Stashed changes
     av_write_trailer(out_fmt_ctx);
     success = true;
 
 
 
 cleanup:
+<<<<<<< Updated upstream
     if (ext_sub_tmp[0]) DeleteFileA(ext_sub_tmp);
     if (pre_filter_frame) av_frame_free(&pre_filter_frame);
     if (pre_filter_sws)   sws_freeContext(pre_filter_sws);
@@ -4496,10 +5476,16 @@ cleanup:
     if (hdr_rgb48_buf) av_free(hdr_rgb48_buf);
     if (hdr_bgr24_buf) av_free(hdr_bgr24_buf);
     if (cpu_frame) av_frame_free(&cpu_frame);
+=======
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    if (yadif_frame) av_frame_free(&yadif_frame);
+    if (yadif_graph) avfilter_graph_free(&yadif_graph);
+>>>>>>> Stashed changes
     if (frame) av_frame_free(&frame);
     if (filt_frame) av_frame_free(&filt_frame);
     if (pkt) av_packet_free(&pkt);
     if (enc_pkt) av_packet_free(&enc_pkt);
+<<<<<<< Updated upstream
     if (dec_ctx)  avcodec_free_context(&dec_ctx);
     if (enc_ctx)  avcodec_free_context(&enc_ctx);
     if (aDec_ctx) avcodec_free_context(&aDec_ctx);
@@ -4508,6 +5494,10 @@ cleanup:
     if (aFrame)    av_frame_free(&aFrame);
     if (aEncFrame) av_frame_free(&aEncFrame);
     if (aEncPkt)   av_packet_free(&aEncPkt);
+=======
+    if (dec_ctx) avcodec_free_context(&dec_ctx);
+    if (enc_ctx) avcodec_free_context(&enc_ctx);
+>>>>>>> Stashed changes
     if (in_fmt_ctx) avformat_close_input(&in_fmt_ctx);
     if (out_fmt_ctx) {
         if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_fmt_ctx->pb);
